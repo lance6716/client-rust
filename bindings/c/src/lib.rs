@@ -125,6 +125,7 @@ pub enum tikv_metric_sample_kind_t {
     TIKV_METRIC_SAMPLE_HISTOGRAM_BUCKET = 2,
     TIKV_METRIC_SAMPLE_HISTOGRAM_SUM = 3,
     TIKV_METRIC_SAMPLE_HISTOGRAM_COUNT = 4,
+    TIKV_METRIC_SAMPLE_GAUGE = 5,
 }
 
 #[repr(C)]
@@ -273,6 +274,7 @@ struct ClientLifecycle {
     accepting: AtomicBool,
     inflight: Mutex<usize>,
     drain_ready: Condvar,
+    metrics: Arc<metrics::BindingMetrics>,
 }
 
 /// Keeps a client operation counted until its callback has returned.
@@ -282,6 +284,9 @@ struct ClientLifecycle {
 /// callbacks that are still running.
 struct InflightGuard {
     lifecycle: Arc<ClientLifecycle>,
+    // Drain registration precedes the final shutdown check. Only accepted
+    // submissions also enter the public metrics.
+    accepted: bool,
 }
 
 impl InflightGuard {
@@ -289,7 +294,13 @@ impl InflightGuard {
         inflight_add(lifecycle);
         Self {
             lifecycle: Arc::clone(lifecycle),
+            accepted: false,
         }
+    }
+
+    fn accept(&mut self) {
+        self.lifecycle.metrics.accept();
+        self.accepted = true;
     }
 }
 
@@ -303,6 +314,9 @@ impl Drop for InflightGuard {
             .inflight
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.accepted {
+            self.lifecycle.metrics.release();
+        }
         *inflight -= 1;
         if *inflight == 0 && !self.lifecycle.accepting.load(Ordering::Acquire) {
             self.lifecycle.drain_ready.notify_all();

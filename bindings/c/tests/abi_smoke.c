@@ -27,9 +27,9 @@ int main(void) {
   tikv_error_destroy(error);
   error = NULL;
 
-  /* This fresh process has no RPC metrics. Check the C array layout and empty
+  /* This fresh process has no request metrics. Check the C array layout and empty
    * view contract, and release the snapshot using its public destroy function.
-   * Populated samples and histogram values are covered by the Rust tests.
+   * Numeric histogram values are covered by the Rust tests.
    */
   tikv_metrics_snapshot_t *snapshot = NULL;
   tikv_metric_samples_t samples = {NULL, 123};
@@ -39,6 +39,50 @@ int main(void) {
   assert(snapshot != NULL);
   assert(samples.ptr == NULL);
   assert(samples.len == 0);
+  tikv_metrics_snapshot_destroy(snapshot);
+
+  /* Invalid input fails before request creation. Verify that the binding still
+   * exports its rejection counter and the new gauge kind with a NULL label,
+   * using only the public ABI and no running cluster.
+   */
+  tikv_async_request_t *request = NULL;
+  tikv_slice_t invalid_key = {NULL, 1};
+  status = tikv_async_raw_get_submit(NULL, invalid_key, NULL, NULL, &request, &error);
+  assert(status == TIKV_STATUS_INVALID_ARGUMENT);
+  assert(request == NULL);
+  assert(error != NULL);
+  tikv_error_destroy(error);
+  error = NULL;
+  status = tikv_metrics_snapshot_collect(&snapshot, &samples, &error);
+  assert(status == TIKV_STATUS_OK);
+  assert(error == NULL);
+  assert(snapshot != NULL);
+  assert(samples.ptr != NULL);
+  assert(samples.len == 6);
+  size_t gauges = 0;
+  size_t rejections = 0;
+  for (size_t i = 0; i < samples.len; ++i) {
+    const tikv_metric_sample_t *sample = &samples.ptr[i];
+    assert(sample->name != NULL);
+    if (strcmp(sample->name, TIKV_METRIC_FFI_REQUESTS_INFLIGHT) == 0) {
+      assert(sample->kind == TIKV_METRIC_SAMPLE_GAUGE);
+      assert(sample->type_label == NULL);
+      assert(sample->value == 0);
+      ++gauges;
+    } else {
+      assert(sample->kind == TIKV_METRIC_SAMPLE_COUNTER);
+      assert(sample->type_label != NULL);
+      if (strcmp(sample->name, TIKV_METRIC_FFI_SUBMISSIONS_TOTAL) == 0 &&
+          strcmp(sample->type_label, TIKV_METRIC_LABEL_TYPE_REJECTED) == 0) {
+        assert(sample->value == 1);
+        ++rejections;
+      } else {
+        assert(sample->value == 0);
+      }
+    }
+  }
+  assert(gauges == 1);
+  assert(rejections == 1);
   tikv_metrics_snapshot_destroy(snapshot);
   return 0;
 }

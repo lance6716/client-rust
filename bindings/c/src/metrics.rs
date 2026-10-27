@@ -1,6 +1,106 @@
 // Copyright 2026 TiKV Project Authors. Licensed under Apache-2.0.
 
 use super::*;
+use prometheus::{IntCounter, IntCounterVec, IntGauge, Opts, Registry};
+use std::sync::LazyLock;
+
+pub(crate) struct BindingMetrics {
+    accepted: IntCounter,
+    rejected: IntCounter,
+    completed: [IntCounter; 3],
+    inflight: IntGauge,
+}
+
+pub(crate) fn binding_metrics() -> &'static Arc<BindingMetrics> {
+    static METRICS: LazyLock<Arc<BindingMetrics>> = LazyLock::new(|| {
+        Arc::new(BindingMetrics::new(prometheus::default_registry()).expect("register FFI metrics"))
+    });
+    &METRICS
+}
+
+impl BindingMetrics {
+    pub(crate) fn new(registry: &Registry) -> prometheus::Result<Self> {
+        let submissions = IntCounterVec::new(
+            Opts::new("tikv_ffi_submissions_total", "C request submissions"),
+            &["type"],
+        )?;
+        let completions = IntCounterVec::new(
+            Opts::new(
+                "tikv_ffi_completions_total",
+                "C callbacks that have returned",
+            ),
+            &["type"],
+        )?;
+        let inflight = IntGauge::new(
+            "tikv_ffi_requests_inflight",
+            "Accepted C requests whose callbacks have not returned",
+        )?;
+        let metrics = Self {
+            accepted: submissions.with_label_values(&["accepted"]),
+            rejected: submissions.with_label_values(&["rejected"]),
+            completed: ["ok", "error", "panic"]
+                .map(|label| completions.with_label_values(&[label])),
+            inflight: inflight.clone(),
+        };
+        registry.register(Box::new(submissions))?;
+        registry.register(Box::new(completions))?;
+        registry.register(Box::new(inflight))?;
+        Ok(metrics)
+    }
+
+    // Wrap the whole submit call: input validation can fail before submit_common.
+    pub(crate) fn submit<F>(&self, out_error: *mut *mut tikv_error_t, f: F) -> tikv_status_t
+    where
+        F: FnOnce() -> FfiResult<()>,
+    {
+        match run_ffi(out_error, f) {
+            Ok(()) => tikv_status_t::TIKV_STATUS_OK,
+            Err(status) => {
+                self.rejected.inc();
+                status
+            }
+        }
+    }
+
+    pub(crate) fn accept(&self) {
+        self.accepted.inc();
+        self.inflight.inc();
+    }
+
+    pub(crate) fn complete(&self, status: tikv_status_t) {
+        let index = match status {
+            tikv_status_t::TIKV_STATUS_OK => 0,
+            tikv_status_t::TIKV_STATUS_PANIC => 2,
+            _ => 1,
+        };
+        self.completed[index].inc();
+    }
+
+    pub(crate) fn release(&self) {
+        self.inflight.dec();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn counts(&self) -> (u64, u64, [u64; 3], i64) {
+        (
+            self.accepted.get(),
+            self.rejected.get(),
+            self.completed.each_ref().map(IntCounter::get),
+            self.inflight.get(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn assert_counts(
+        &self,
+        accepted: u64,
+        rejected: u64,
+        completed: [u64; 3],
+        inflight: i64,
+    ) {
+        assert_eq!(self.counts(), (accepted, rejected, completed, inflight));
+    }
+}
 
 struct MetricsSnapshot {
     samples: Vec<tikv_metric_sample_t>,
@@ -25,21 +125,23 @@ impl MetricsSnapshot {
         &mut self,
         name: &str,
         kind: tikv_metric_sample_kind_t,
-        type_label: &str,
+        type_label: Option<&str>,
         value: f64,
         le: f64,
     ) {
         let name = ffi_cstring(name);
-        let type_label = ffi_cstring(type_label);
+        let type_label = type_label.map(ffi_cstring);
         self.samples.push(tikv_metric_sample_t {
             name: name.as_ptr(),
-            type_label: type_label.as_ptr(),
+            type_label: type_label
+                .as_ref()
+                .map_or(ptr::null(), |label| label.as_ptr()),
             kind,
             value,
             le,
         });
         self._strings.push(name);
-        self._strings.push(type_label);
+        self._strings.extend(type_label);
     }
 }
 
@@ -51,15 +153,17 @@ fn collect_metrics_snapshot(registry: &prometheus::Registry) -> MetricsSnapshot 
 
     for family in registry.gather() {
         let name = family.get_name();
-        // These request families have a single `type` label in client-rust.
-        // Restrict both names and types so the C representation is lossless.
+        // Counters and histograms have a single `type` label; the FFI gauge
+        // has none. Restrict names, types, and labels to a lossless C view.
         if !matches!(
             (name, family.get_field_type()),
             (
                 "tikv_request_total"
                     | "tikv_failed_request_total"
                     | "pd_request_total"
-                    | "pd_failed_request_total",
+                    | "pd_failed_request_total"
+                    | "tikv_ffi_submissions_total"
+                    | "tikv_ffi_completions_total",
                 MetricType::COUNTER
             ) | (
                 "tikv_request_duration_seconds"
@@ -67,7 +171,7 @@ fn collect_metrics_snapshot(registry: &prometheus::Registry) -> MetricsSnapshot 
                     | "pd_request_duration_seconds"
                     | "pd_failed_request_duration_seconds",
                 MetricType::HISTOGRAM
-            )
+            ) | ("tikv_ffi_requests_inflight", MetricType::GAUGE)
         ) {
             continue;
         }
@@ -81,7 +185,7 @@ fn collect_metrics_snapshot(registry: &prometheus::Registry) -> MetricsSnapshot 
                     snapshot.push(
                         name,
                         tikv_metric_sample_kind_t::TIKV_METRIC_SAMPLE_COUNTER,
-                        type_label,
+                        Some(type_label),
                         metric.get_counter().get_value(),
                         0.0,
                     );
@@ -100,7 +204,7 @@ fn collect_metrics_snapshot(registry: &prometheus::Registry) -> MetricsSnapshot 
                         snapshot.push(
                             name,
                             tikv_metric_sample_kind_t::TIKV_METRIC_SAMPLE_HISTOGRAM_BUCKET,
-                            type_label,
+                            Some(type_label),
                             bucket.get_cumulative_count() as f64,
                             upper_bound,
                         );
@@ -109,7 +213,7 @@ fn collect_metrics_snapshot(registry: &prometheus::Registry) -> MetricsSnapshot 
                         snapshot.push(
                             name,
                             tikv_metric_sample_kind_t::TIKV_METRIC_SAMPLE_HISTOGRAM_BUCKET,
-                            type_label,
+                            Some(type_label),
                             histogram.get_sample_count() as f64,
                             f64::INFINITY,
                         );
@@ -117,17 +221,30 @@ fn collect_metrics_snapshot(registry: &prometheus::Registry) -> MetricsSnapshot 
                     snapshot.push(
                         name,
                         tikv_metric_sample_kind_t::TIKV_METRIC_SAMPLE_HISTOGRAM_SUM,
-                        type_label,
+                        Some(type_label),
                         histogram.get_sample_sum(),
                         0.0,
                     );
                     snapshot.push(
                         name,
                         tikv_metric_sample_kind_t::TIKV_METRIC_SAMPLE_HISTOGRAM_COUNT,
-                        type_label,
+                        Some(type_label),
                         histogram.get_sample_count() as f64,
                         0.0,
                     );
+                }
+            }
+            MetricType::GAUGE => {
+                for metric in family.get_metric() {
+                    if metric.get_label().is_empty() {
+                        snapshot.push(
+                            name,
+                            tikv_metric_sample_kind_t::TIKV_METRIC_SAMPLE_GAUGE,
+                            None,
+                            metric.get_gauge().get_value(),
+                            0.0,
+                        );
+                    }
                 }
             }
             _ => {}
@@ -207,10 +324,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn snapshot_exports_only_client_request_families() {
+    fn snapshot_exports_only_supported_client_and_binding_families() {
         // A known observation checks cumulative buckets, sum, count, and labels
         // for every supported family while unrelated registry data is excluded.
         let registry = prometheus::Registry::new();
+        let binding = BindingMetrics::new(&registry).unwrap();
+        binding.accept();
+        binding.accept();
+        binding.complete(tikv_status_t::TIKV_STATUS_ERROR);
+        binding.release();
         let counter_names = [
             "tikv_request_total",
             "tikv_failed_request_total",
@@ -264,8 +386,40 @@ mod tests {
         let mut histogram_buckets = 0;
         let mut histogram_sums = 0;
         let mut histogram_counts = 0;
+        let mut binding_samples = 0;
         for sample in &snapshot.samples {
-            names.insert(unsafe { CStr::from_ptr(sample.name) }.to_str().unwrap());
+            let name = unsafe { CStr::from_ptr(sample.name) }.to_str().unwrap();
+            names.insert(name);
+            if name.starts_with("tikv_ffi_") {
+                // Export real binding collectors, including zero-valued series
+                // and an unlabeled gauge while one accepted request is active.
+                binding_samples += 1;
+                if name == "tikv_ffi_requests_inflight" {
+                    assert_eq!(
+                        sample.kind,
+                        tikv_metric_sample_kind_t::TIKV_METRIC_SAMPLE_GAUGE
+                    );
+                    assert!(sample.type_label.is_null());
+                    assert_eq!(sample.value, 1.0);
+                } else {
+                    assert_eq!(
+                        sample.kind,
+                        tikv_metric_sample_kind_t::TIKV_METRIC_SAMPLE_COUNTER
+                    );
+                    let label = unsafe { CStr::from_ptr(sample.type_label) }
+                        .to_str()
+                        .unwrap();
+                    let expected = match (name, label) {
+                        ("tikv_ffi_submissions_total", "accepted") => 2.0,
+                        ("tikv_ffi_completions_total", "error") => 1.0,
+                        ("tikv_ffi_submissions_total", "rejected")
+                        | ("tikv_ffi_completions_total", "ok" | "panic") => 0.0,
+                        _ => panic!("unexpected binding metric: {name} {label}"),
+                    };
+                    assert_eq!(sample.value, expected);
+                }
+                continue;
+            }
             assert_eq!(
                 unsafe { CStr::from_ptr(sample.type_label) }.to_bytes(),
                 b"raw_get"
@@ -297,9 +451,18 @@ mod tests {
         assert_eq!(histogram_buckets, histogram_names.len() * 3);
         assert_eq!(histogram_sums, histogram_names.len());
         assert_eq!(histogram_counts, histogram_names.len());
+        assert_eq!(binding_samples, 6);
         assert_eq!(
             names,
-            counter_names.into_iter().chain(histogram_names).collect()
+            counter_names
+                .into_iter()
+                .chain(histogram_names)
+                .chain([
+                    "tikv_ffi_submissions_total",
+                    "tikv_ffi_completions_total",
+                    "tikv_ffi_requests_inflight",
+                ])
+                .collect()
         );
     }
 
@@ -359,6 +522,14 @@ mod tests {
         .unwrap();
         histogram.with_label_values(&["raw_get"]).observe(0.01);
         registry.register(Box::new(histogram)).unwrap();
+
+        let gauge = prometheus::IntGaugeVec::new(
+            prometheus::Opts::new("tikv_ffi_requests_inflight", "unexpected label"),
+            &["type"],
+        )
+        .unwrap();
+        gauge.with_label_values(&["put"]).set(1);
+        registry.register(Box::new(gauge)).unwrap();
 
         assert!(collect_metrics_snapshot(&registry).samples.is_empty());
     }

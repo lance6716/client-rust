@@ -80,6 +80,7 @@ fn new_client_handle(
                 accepting: AtomicBool::new(true),
                 inflight: Mutex::new(0),
                 drain_ready: Condvar::new(),
+                metrics: Arc::clone(metrics::binding_metrics()),
             }),
         }),
     })

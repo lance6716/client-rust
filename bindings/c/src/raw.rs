@@ -142,7 +142,7 @@ pub unsafe extern "C" fn tikv_async_raw_put_submit(
         unsafe { *out_request = ptr::null_mut() };
     }
 
-    match run_ffi(out_error, || {
+    metrics::binding_metrics().submit(out_error, || {
         let key = slice_to_key(key, "key")?;
         let value = slice_to_vec(value, "value")?;
         submit_common(
@@ -161,10 +161,7 @@ pub unsafe extern "C" fn tikv_async_raw_put_submit(
                 }))
             },
         )
-    }) {
-        Ok(()) => tikv_status_t::TIKV_STATUS_OK,
-        Err(status) => status,
-    }
+    })
 }
 
 /// # Safety
@@ -183,7 +180,7 @@ pub unsafe extern "C" fn tikv_async_raw_get_submit(
         unsafe { *out_request = ptr::null_mut() };
     }
 
-    match run_ffi(out_error, || {
+    metrics::binding_metrics().submit(out_error, || {
         let key = slice_to_key(key, "key")?;
         submit_common(
             client,
@@ -201,10 +198,7 @@ pub unsafe extern "C" fn tikv_async_raw_get_submit(
                 }))
             },
         )
-    }) {
-        Ok(()) => tikv_status_t::TIKV_STATUS_OK,
-        Err(status) => status,
-    }
+    })
 }
 
 /// # Safety
@@ -223,7 +217,7 @@ pub unsafe extern "C" fn tikv_async_raw_delete_submit(
         unsafe { *out_request = ptr::null_mut() };
     }
 
-    match run_ffi(out_error, || {
+    metrics::binding_metrics().submit(out_error, || {
         let key = slice_to_key(key, "key")?;
         submit_common(
             client,
@@ -241,10 +235,7 @@ pub unsafe extern "C" fn tikv_async_raw_delete_submit(
                 }))
             },
         )
-    }) {
-        Ok(()) => tikv_status_t::TIKV_STATUS_OK,
-        Err(status) => status,
-    }
+    })
 }
 
 /// # Safety
@@ -264,7 +255,7 @@ pub unsafe extern "C" fn tikv_async_raw_delete_range_submit(
         unsafe { *out_request = ptr::null_mut() };
     }
 
-    match run_ffi(out_error, || {
+    metrics::binding_metrics().submit(out_error, || {
         let range = slice_to_range(start_key, end_key)?;
         submit_common(
             client,
@@ -282,10 +273,7 @@ pub unsafe extern "C" fn tikv_async_raw_delete_range_submit(
                 }))
             },
         )
-    }) {
-        Ok(()) => tikv_status_t::TIKV_STATUS_OK,
-        Err(status) => status,
-    }
+    })
 }
 
 /// # Safety
@@ -306,7 +294,7 @@ pub unsafe extern "C" fn tikv_async_raw_scan_submit(
         unsafe { *out_request = ptr::null_mut() };
     }
 
-    match run_ffi(out_error, || {
+    metrics::binding_metrics().submit(out_error, || {
         let range = slice_to_range(start_key, end_key)?;
         submit_common(
             client,
@@ -324,10 +312,7 @@ pub unsafe extern "C" fn tikv_async_raw_scan_submit(
                 }))
             },
         )
-    }) {
-        Ok(()) => tikv_status_t::TIKV_STATUS_OK,
-        Err(status) => status,
-    }
+    })
 }
 
 /// # Safety
@@ -348,7 +333,7 @@ pub unsafe extern "C" fn tikv_async_raw_scan_reverse_submit(
         unsafe { *out_request = ptr::null_mut() };
     }
 
-    match run_ffi(out_error, || {
+    metrics::binding_metrics().submit(out_error, || {
         if slice_is_empty(start_key) {
             return Err(FfiError::invalid_argument(
                 "scan_reverse does not support empty start_key in client-rust",
@@ -371,10 +356,7 @@ pub unsafe extern "C" fn tikv_async_raw_scan_reverse_submit(
                 }))
             },
         )
-    }) {
-        Ok(()) => tikv_status_t::TIKV_STATUS_OK,
-        Err(status) => status,
-    }
+    })
 }
 
 /// # Safety
@@ -393,7 +375,7 @@ pub unsafe extern "C" fn tikv_async_raw_batch_write_submit(
         unsafe { *out_request = ptr::null_mut() };
     }
 
-    match run_ffi(out_error, || {
+    metrics::binding_metrics().submit(out_error, || {
         let runs = build_write_batch_runs(slice_mutations_to_owned(mutations)?);
         submit_common(
             client,
@@ -408,10 +390,7 @@ pub unsafe extern "C" fn tikv_async_raw_batch_write_submit(
                 }))
             },
         )
-    }) {
-        Ok(()) => tikv_status_t::TIKV_STATUS_OK,
-        Err(status) => status,
-    }
+    })
 }
 
 /// # Safety
@@ -430,7 +409,7 @@ pub unsafe extern "C" fn tikv_async_raw_batch_get_submit(
         unsafe { *out_request = ptr::null_mut() };
     }
 
-    match run_ffi(out_error, || {
+    metrics::binding_metrics().submit(out_error, || {
         let keys = slices_to_keys(keys, "keys")?;
         submit_common(
             client,
@@ -451,8 +430,5 @@ pub unsafe extern "C" fn tikv_async_raw_batch_get_submit(
                 }))
             },
         )
-    }) {
-        Ok(()) => tikv_status_t::TIKV_STATUS_OK,
-        Err(status) => status,
-    }
+    })
 }

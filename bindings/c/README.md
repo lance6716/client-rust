@@ -54,17 +54,33 @@ may issue multiple TiKV requests.
 
 ## Metrics snapshots
 
-`tikv_metrics_snapshot_collect` exports only the eight client-rust TiKV/PD
-request counter and duration histogram families named in
-`tikv_client_metrics_c.h`. It reads the process-wide Prometheus default registry,
-so values include all client instances, including callers outside the C API.
-It accepts only the expected metric type for each family and samples whose sole
-label is `type`; other families and incompatible samples are skipped. Histogram
-samples include cumulative buckets (including +Inf), sum, and count. One call
-returns the snapshot handle and a read-only view of all samples in a contiguous
-array. The array and its strings remain valid until the snapshot is destroyed
-with `tikv_metrics_snapshot_destroy`. For an empty snapshot, the array view is
-`{NULL, 0}`.
+`tikv_metrics_snapshot_collect` exports the eight client-rust TiKV/PD RPC
+families and three C binding families named in `tikv_client_metrics_c.h`. It
+reads the process-wide Prometheus default registry, so values aggregate all
+client instances. RPC values also include callers outside the C API.
+
+The C binding families count RawKV submissions:
+
+- `tikv_ffi_submissions_total{type="accepted"|"rejected"}` counts each submit
+  once. Every non-OK return counts as rejected, including invalid arguments,
+  shutdown rejection, and a panic before acceptance.
+- `tikv_ffi_completions_total{type="ok"|"error"|"panic"}` counts accepted
+  requests by final status after their callbacks return.
+- `tikv_ffi_requests_inflight` is an unlabeled gauge of accepted requests whose
+  callbacks have not returned. Retaining a completed C request handle does not
+  keep it in flight.
+
+Client creation, result access, and destruction do not count as submissions.
+The FFI series are initialized on the first successful client creation or
+RawKV submit call, including a rejected call. The snapshot is not an atomic
+view across series when requests are being submitted or completed concurrently.
+
+Only the expected types and labels are exported. Counters and histograms have
+one `type` label; its value is in `type_label`. The gauge has `type_label = NULL`.
+Histogram samples include cumulative buckets (including +Inf), sum, and count.
+One call returns the snapshot handle and a read-only contiguous array. The
+array and its strings remain valid until `tikv_metrics_snapshot_destroy`.
+For an empty snapshot, the array view is `{NULL, 0}`.
 
 The existing `tikv_request_total` and `pd_request_total` metrics count
 underlying RPC attempts. A single C operation can issue multiple RPCs due to

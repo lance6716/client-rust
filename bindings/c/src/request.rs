@@ -61,16 +61,18 @@ fn finalize_request(
 fn spawn_request<F>(
     handle: &Handle,
     request: Arc<RequestState>,
-    inflight: InflightGuard,
+    mut inflight: InflightGuard,
     future: F,
 ) -> tokio::task::JoinHandle<()>
 where
     F: std::future::Future<Output = FfiResult<RequestOutput>> + Send + 'static,
 {
+    // Only accepted requests enter the public gauge. Count before spawning,
+    // since a worker can finish and run the callback before submit returns.
+    inflight.accept();
     handle.spawn(async move {
         // Keep the inflight registration until finalize_request returns, so
         // client drain waits for the callback but not for a retained C handle.
-        let _inflight = inflight;
         let result = AssertUnwindSafe(future).catch_unwind().await;
         let (status, output, error_message) = match result {
             Ok(Ok(output)) => (tikv_status_t::TIKV_STATUS_OK, Some(output), None),
@@ -83,6 +85,8 @@ where
         };
 
         finalize_request(request, status, output, error_message);
+        inflight.lifecycle.metrics.complete(status);
+        drop(inflight);
     })
 }
 
@@ -337,6 +341,8 @@ mod tests {
             accepting: AtomicBool::new(true),
             inflight: Mutex::new(0),
             drain_ready: Condvar::new(),
+            // Avoid sharing global counters between concurrently running tests.
+            metrics: Arc::new(metrics::BindingMetrics::new(&prometheus::Registry::new()).unwrap()),
         })
     }
 
@@ -375,7 +381,8 @@ mod tests {
     #[test]
     fn accepted_requests_complete_once_and_allow_destruction_in_callback() {
         // All terminal outcomes must deliver one callback and release the task's
-        // reference safely when that callback destroys the C handle.
+        // reference safely when that callback destroys the C handle. Metrics
+        // must count the acceptance and the returned callback exactly once.
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let (sender, receiver) = mpsc::channel::<CompletionReport>();
         let outcomes = [
@@ -395,7 +402,8 @@ mod tests {
                 Some("panic across FFI boundary: operation panicked"),
             ),
         ];
-        for (future, expected_status, expected_message) in outcomes {
+        for (index, (future, expected_status, expected_message)) in outcomes.into_iter().enumerate()
+        {
             let lifecycle = lifecycle();
             let (request, inflight) = make_request_state(
                 RequestKind::Put,
@@ -417,10 +425,48 @@ mod tests {
             ));
             assert_eq!(Arc::strong_count(&lifecycle), 1);
             assert!(weak_request.upgrade().is_none());
+            let mut completed = [0; 3];
+            completed[index] = 1;
+            lifecycle.metrics.assert_counts(1, 0, completed, 0);
             // Completion can precede shutdown, leaving no future notification.
             lifecycle.accepting.store(false, Ordering::Release);
             wait_drain(&lifecycle);
         }
+    }
+
+    #[test]
+    fn rejected_submissions_roll_back_provisional_inflight_registration() {
+        // Validation errors, shutdown rejection, and pre-acceptance panics all
+        // count as rejected without a callback or an accepted-request gauge leak.
+        let lifecycle = lifecycle();
+        for (index, expected) in [
+            tikv_status_t::TIKV_STATUS_INVALID_ARGUMENT,
+            tikv_status_t::TIKV_STATUS_REJECTED,
+            tikv_status_t::TIKV_STATUS_PANIC,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let status = lifecycle.metrics.submit(ptr::null_mut(), || {
+                let _provisional = InflightGuard::new(&lifecycle);
+                match expected {
+                    tikv_status_t::TIKV_STATUS_INVALID_ARGUMENT => {
+                        Err(FfiError::invalid_argument("invalid input"))
+                    }
+                    tikv_status_t::TIKV_STATUS_REJECTED => {
+                        Err(FfiError::rejected("client is shutting down"))
+                    }
+                    _ => panic!("submission panicked"),
+                }
+            });
+            assert_eq!(status, expected);
+            lifecycle
+                .metrics
+                .assert_counts(0, index as u64 + 1, [0; 3], 0);
+            assert_eq!(*lifecycle.inflight.lock().unwrap(), 0);
+        }
+        lifecycle.accepting.store(false, Ordering::Release);
+        wait_drain(&lifecycle);
     }
 
     struct BlockingCallback {
@@ -444,6 +490,7 @@ mod tests {
     fn shutdown_drains_all_callbacks_but_preserves_retained_results() {
         // Gate two accepted operations so an error completing during shutdown
         // cannot drain the client while another operation or callback is active.
+        // The public gauge includes a blocked callback, but not a retained result.
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let lifecycle = lifecycle();
         let weak_lifecycle = Arc::downgrade(&lifecycle);
@@ -486,6 +533,7 @@ mod tests {
                 Err(FfiError::error("operation failed during shutdown"))
             },
         );
+        lifecycle.metrics.assert_counts(2, 0, [0; 3], 2);
         lifecycle.accepting.store(false, Ordering::Release);
         let (drain_started_sender, drain_started_receiver) = mpsc::channel();
         let (drained_sender, drained_receiver) = mpsc::channel();
@@ -503,6 +551,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .unwrap();
         runtime.block_on(other_task).unwrap();
+        lifecycle.metrics.assert_counts(2, 0, [0, 1, 0], 1);
         let after_first_completion = drained_receiver.recv_timeout(Duration::from_millis(50));
         finish_sender.send(()).unwrap();
         let callback_status = entered_receiver
@@ -510,12 +559,17 @@ mod tests {
             .unwrap();
         let alive_during_callback = weak_request.upgrade().is_some();
         let during_callback = drained_receiver.recv_timeout(Duration::from_millis(50));
+        // Save values before unblocking; assert only after releasing the worker.
+        let metrics = Arc::clone(&lifecycle.metrics);
+        let metrics_during_callback = metrics.counts();
         release_sender.send(()).unwrap();
         drained_receiver
             .recv_timeout(Duration::from_secs(5))
             .unwrap();
         drain_thread.join().unwrap();
         runtime.block_on(task).unwrap();
+        assert_eq!(metrics_during_callback, (2, 0, [0, 1, 0], 1));
+        metrics.assert_counts(2, 0, [1, 1, 0], 0);
         assert_eq!(after_first_completion, Err(mpsc::RecvTimeoutError::Timeout));
         assert_eq!(during_callback, Err(mpsc::RecvTimeoutError::Timeout));
         assert_eq!(report.request_addr, other_raw_request as usize);
