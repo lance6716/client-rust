@@ -137,8 +137,12 @@ fn collect_metrics_snapshot(registry: &prometheus::Registry) -> MetricsSnapshot 
     snapshot
 }
 
+/// # Safety
+/// Non-null output slots must be aligned, writable, mutually disjoint, and
+/// exclusively accessible for this call. Returned views and their strings
+/// must not be modified or used after the snapshot is destroyed.
 #[no_mangle]
-pub extern "C" fn tikv_metrics_snapshot_collect(
+pub unsafe extern "C" fn tikv_metrics_snapshot_collect(
     out_snapshot: *mut *mut tikv_metrics_snapshot_t,
     out_samples: *mut tikv_metric_samples_t,
     out_error: *mut *mut tikv_error_t,
@@ -185,8 +189,11 @@ pub extern "C" fn tikv_metrics_snapshot_collect(
     }
 }
 
+/// # Safety
+/// A non-null `snapshot` must be a live snapshot from this library, destroyed
+/// exactly once after all accesses to its sample array and strings have ended.
 #[no_mangle]
-pub extern "C" fn tikv_metrics_snapshot_destroy(snapshot: *mut tikv_metrics_snapshot_t) {
+pub unsafe extern "C" fn tikv_metrics_snapshot_destroy(snapshot: *mut tikv_metrics_snapshot_t) {
     if snapshot.is_null() {
         return;
     }
@@ -201,6 +208,8 @@ mod tests {
 
     #[test]
     fn snapshot_exports_only_client_request_families() {
+        // A known observation checks cumulative buckets, sum, count, and labels
+        // for every supported family while unrelated registry data is excluded.
         let registry = prometheus::Registry::new();
         let counter_names = [
             "tikv_request_total",
@@ -252,6 +261,8 @@ mod tests {
         let snapshot = collect_metrics_snapshot(&registry);
         let mut names = HashSet::new();
         let mut counters = 0;
+        let mut histogram_buckets = 0;
+        let mut histogram_sums = 0;
         let mut histogram_counts = 0;
         for sample in &snapshot.samples {
             names.insert(unsafe { CStr::from_ptr(sample.name) }.to_str().unwrap());
@@ -265,10 +276,12 @@ mod tests {
                     assert_eq!(sample.value, 3.0);
                 }
                 tikv_metric_sample_kind_t::TIKV_METRIC_SAMPLE_HISTOGRAM_BUCKET => {
+                    histogram_buckets += 1;
                     assert!(sample.le == 0.005 || sample.le == 0.01 || sample.le == f64::INFINITY);
                     assert_eq!(sample.value, if sample.le < 0.01 { 0.0 } else { 1.0 });
                 }
                 tikv_metric_sample_kind_t::TIKV_METRIC_SAMPLE_HISTOGRAM_SUM => {
+                    histogram_sums += 1;
                     assert_eq!(sample.value, 0.01);
                 }
                 tikv_metric_sample_kind_t::TIKV_METRIC_SAMPLE_HISTOGRAM_COUNT => {
@@ -279,6 +292,10 @@ mod tests {
             }
         }
         assert_eq!(counters, counter_names.len());
+        // Require all two finite buckets, the +Inf bucket, and the sum; checking
+        // values only would also pass if a sample kind disappeared entirely.
+        assert_eq!(histogram_buckets, histogram_names.len() * 3);
+        assert_eq!(histogram_sums, histogram_names.len());
         assert_eq!(histogram_counts, histogram_names.len());
         assert_eq!(
             names,
@@ -288,6 +305,8 @@ mod tests {
 
     #[test]
     fn snapshot_skips_incompatible_types_and_labels() {
+        // Incompatible series must not be exported with lost labels or a
+        // misleading sample kind, even when their family name is supported.
         let registry = prometheus::Registry::new();
         let counter = prometheus::IntCounterVec::new(
             prometheus::Opts::new("tikv_request_total", "extra labels"),

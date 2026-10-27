@@ -84,26 +84,38 @@ fn new_client_handle(
         }),
     })
 }
+/// # Safety
+/// Non-null `pd_endpoints_csv` must point to a readable NUL-terminated string.
+/// Non-null output slots must be aligned, writable, exclusively accessible,
+/// and disjoint from each other and the input string for the call.
 #[no_mangle]
-pub extern "C" fn tikv_async_client_new(
+pub unsafe extern "C" fn tikv_async_client_new(
     pd_endpoints_csv: *const c_char,
     timeout_secs: u32,
     use_default_keyspace: bool,
     out_client: *mut *mut tikv_async_client_t,
     out_error: *mut *mut tikv_error_t,
 ) -> tikv_status_t {
-    tikv_async_client_new_with_grpc_max_decoding_message_size(
-        pd_endpoints_csv,
-        timeout_secs,
-        use_default_keyspace,
-        usize::MAX,
-        out_client,
-        out_error,
-    )
+    // SAFETY: the caller provides the same string and output-slot guarantees
+    // required by the explicit-limit constructor.
+    unsafe {
+        tikv_async_client_new_with_grpc_max_decoding_message_size(
+            pd_endpoints_csv,
+            timeout_secs,
+            use_default_keyspace,
+            usize::MAX,
+            out_client,
+            out_error,
+        )
+    }
 }
 
+/// # Safety
+/// Non-null `pd_endpoints_csv` must point to a readable NUL-terminated string.
+/// Non-null output slots must be aligned, writable, exclusively accessible,
+/// and disjoint from each other and the input string for the call.
 #[no_mangle]
-pub extern "C" fn tikv_async_client_new_with_grpc_max_decoding_message_size(
+pub unsafe extern "C" fn tikv_async_client_new_with_grpc_max_decoding_message_size(
     pd_endpoints_csv: *const c_char,
     timeout_secs: u32,
     use_default_keyspace: bool,
@@ -138,8 +150,12 @@ pub extern "C" fn tikv_async_client_new_with_grpc_max_decoding_message_size(
     }
 }
 
+/// # Safety
+/// A non-null `client` must be live and must not be destroyed during this call.
+/// Non-null `out_error` must point to aligned, exclusively writable storage
+/// that does not overlap the client.
 #[no_mangle]
-pub extern "C" fn tikv_async_client_shutdown_begin(
+pub unsafe extern "C" fn tikv_async_client_shutdown_begin(
     client: *mut tikv_async_client_t,
     out_error: *mut *mut tikv_error_t,
 ) -> tikv_status_t {
@@ -157,8 +173,12 @@ pub extern "C" fn tikv_async_client_shutdown_begin(
     }
 }
 
+/// # Safety
+/// A non-null `client` must be a live handle from this library, destroyed
+/// exactly once. All other calls using it must have stopped. This function
+/// must not be called from one of the client's own completion callbacks.
 #[no_mangle]
-pub extern "C" fn tikv_async_client_destroy(client: *mut tikv_async_client_t) {
+pub unsafe extern "C" fn tikv_async_client_destroy(client: *mut tikv_async_client_t) {
     if client.is_null() {
         return;
     }

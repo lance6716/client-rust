@@ -125,8 +125,11 @@ async fn execute_write_batch(client: RawClient, runs: Vec<WriteBatchRun>) -> Ffi
     Ok(())
 }
 
+/// # Safety
+/// The client, input buffers, output slots, callback, and userdata must satisfy
+/// the [submission safety contract](crate).
 #[no_mangle]
-pub extern "C" fn tikv_async_raw_put_submit(
+pub unsafe extern "C" fn tikv_async_raw_put_submit(
     client: *const tikv_async_client_t,
     key: tikv_slice_t,
     value: tikv_slice_t,
@@ -164,8 +167,11 @@ pub extern "C" fn tikv_async_raw_put_submit(
     }
 }
 
+/// # Safety
+/// The client, input buffers, output slots, callback, and userdata must satisfy
+/// the [submission safety contract](crate).
 #[no_mangle]
-pub extern "C" fn tikv_async_raw_get_submit(
+pub unsafe extern "C" fn tikv_async_raw_get_submit(
     client: *const tikv_async_client_t,
     key: tikv_slice_t,
     completion: Option<tikv_async_completion_cb>,
@@ -201,8 +207,11 @@ pub extern "C" fn tikv_async_raw_get_submit(
     }
 }
 
+/// # Safety
+/// The client, input buffers, output slots, callback, and userdata must satisfy
+/// the [submission safety contract](crate).
 #[no_mangle]
-pub extern "C" fn tikv_async_raw_delete_submit(
+pub unsafe extern "C" fn tikv_async_raw_delete_submit(
     client: *const tikv_async_client_t,
     key: tikv_slice_t,
     completion: Option<tikv_async_completion_cb>,
@@ -238,8 +247,11 @@ pub extern "C" fn tikv_async_raw_delete_submit(
     }
 }
 
+/// # Safety
+/// The client, input buffers, output slots, callback, and userdata must satisfy
+/// the [submission safety contract](crate).
 #[no_mangle]
-pub extern "C" fn tikv_async_raw_delete_range_submit(
+pub unsafe extern "C" fn tikv_async_raw_delete_range_submit(
     client: *const tikv_async_client_t,
     start_key: tikv_slice_t,
     end_key: tikv_slice_t,
@@ -276,8 +288,11 @@ pub extern "C" fn tikv_async_raw_delete_range_submit(
     }
 }
 
+/// # Safety
+/// The client, input buffers, output slots, callback, and userdata must satisfy
+/// the [submission safety contract](crate).
 #[no_mangle]
-pub extern "C" fn tikv_async_raw_scan_submit(
+pub unsafe extern "C" fn tikv_async_raw_scan_submit(
     client: *const tikv_async_client_t,
     start_key: tikv_slice_t,
     end_key: tikv_slice_t,
@@ -315,8 +330,11 @@ pub extern "C" fn tikv_async_raw_scan_submit(
     }
 }
 
+/// # Safety
+/// The client, input buffers, output slots, callback, and userdata must satisfy
+/// the [submission safety contract](crate).
 #[no_mangle]
-pub extern "C" fn tikv_async_raw_scan_reverse_submit(
+pub unsafe extern "C" fn tikv_async_raw_scan_reverse_submit(
     client: *const tikv_async_client_t,
     start_key: tikv_slice_t,
     end_key: tikv_slice_t,
@@ -359,8 +377,11 @@ pub extern "C" fn tikv_async_raw_scan_reverse_submit(
     }
 }
 
+/// # Safety
+/// The client, input buffers, output slots, callback, and userdata must satisfy
+/// the [submission safety contract](crate).
 #[no_mangle]
-pub extern "C" fn tikv_async_raw_batch_write_submit(
+pub unsafe extern "C" fn tikv_async_raw_batch_write_submit(
     client: *const tikv_async_client_t,
     mutations: tikv_async_raw_mutations_t,
     completion: Option<tikv_async_completion_cb>,
@@ -393,8 +414,11 @@ pub extern "C" fn tikv_async_raw_batch_write_submit(
     }
 }
 
+/// # Safety
+/// The client, input buffers, output slots, callback, and userdata must satisfy
+/// the [submission safety contract](crate).
 #[no_mangle]
-pub extern "C" fn tikv_async_raw_batch_get_submit(
+pub unsafe extern "C" fn tikv_async_raw_batch_get_submit(
     client: *const tikv_async_client_t,
     keys: tikv_slices_t,
     completion: Option<tikv_async_completion_cb>,

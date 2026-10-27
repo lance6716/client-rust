@@ -1,6 +1,28 @@
 // Copyright 2026 TiKV Project Authors. Licensed under Apache-2.0.
 
+//! Asynchronous TiKV C ABI.
+//!
+//! # Submission safety contract
+//!
+//! A non-null client handle must be live and must not be destroyed during a
+//! submit call. Input slices and arrays must be aligned and readable for their
+//! declared lengths within one allocation, with sizes no larger than `isize::MAX`.
+//! Input memory must not be mutated during submission; it is copied before the
+//! call returns. Unused DELETE value slices are ignored.
+//!
+//! Non-null output slots must be aligned, writable, and exclusively accessible
+//! for the call, and must not overlap each other, input memory, or handle state.
+//! Null arguments are accepted only as documented in the C headers or rejected
+//! as invalid.
+//!
+//! Completion callbacks must not unwind. Their userdata must remain valid and
+//! usable on runtime worker threads until the callback returns. Request access
+//! and destruction must be serialized, in the callback or after synchronizing
+//! with it; a request handle must be destroyed exactly once. A callback may run
+//! and destroy the handle before submission returns.
+
 #![allow(non_camel_case_types)]
+#![deny(unsafe_op_in_unsafe_fn)]
 
 mod client;
 mod metrics;
@@ -510,16 +532,22 @@ fn slice_to_key(raw: tikv_slice_t, name: &str) -> FfiResult<Key> {
     Ok(Key::from(slice_to_vec(raw, name)?))
 }
 
+/// # Safety
+/// A non-null `error` must be a live error from this library. It must not be
+/// destroyed while this function or the returned borrowed string is in use.
 #[no_mangle]
-pub extern "C" fn tikv_error_message(error: *const tikv_error_t) -> *const c_char {
+pub unsafe extern "C" fn tikv_error_message(error: *const tikv_error_t) -> *const c_char {
     if error.is_null() {
         return ptr::null();
     }
     unsafe { (*error).message.as_ptr() }
 }
 
+/// # Safety
+/// A non-null `error` must be a live error from this library, released exactly
+/// once with no concurrent access or subsequent use of its borrowed message.
 #[no_mangle]
-pub extern "C" fn tikv_error_destroy(error: *mut tikv_error_t) {
+pub unsafe extern "C" fn tikv_error_destroy(error: *mut tikv_error_t) {
     if error.is_null() {
         return;
     }
@@ -528,8 +556,11 @@ pub extern "C" fn tikv_error_destroy(error: *mut tikv_error_t) {
     }
 }
 
+/// # Safety
+/// `bytes` must be empty or an unchanged buffer returned by this library. Its
+/// allocation must be released exactly once, after all accesses have finished.
 #[no_mangle]
-pub extern "C" fn tikv_owned_bytes_destroy(bytes: tikv_owned_bytes_t) {
+pub unsafe extern "C" fn tikv_owned_bytes_destroy(bytes: tikv_owned_bytes_t) {
     if bytes.ptr.is_null() || bytes.len == 0 {
         return;
     }
@@ -538,8 +569,12 @@ pub extern "C" fn tikv_owned_bytes_destroy(bytes: tikv_owned_bytes_t) {
     }
 }
 
+/// # Safety
+/// `pairs` must be empty or an unchanged array returned by this library. The
+/// array and its nested buffers must still be owned by the caller and must be
+/// released exactly once, after all accesses have finished.
 #[no_mangle]
-pub extern "C" fn tikv_kv_pairs_destroy(pairs: tikv_kv_pairs_t) {
+pub unsafe extern "C" fn tikv_kv_pairs_destroy(pairs: tikv_kv_pairs_t) {
     if pairs.ptr.is_null() || pairs.len == 0 {
         return;
     }
