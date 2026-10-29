@@ -30,9 +30,8 @@ returned handle must not be used if the callback already destroyed it.
 Error and result accessors may be used only in the completion callback or after
 synchronizing with it to observe completion. The callback's `final_status` is
 the terminal request status. Serialize all accessors and destruction for the
-same request, including calls from its callback. A cross-thread handoff must
-happen after the previous thread's last access and must synchronize the two
-threads. Different requests may be accessed concurrently.
+same request, including calls from its callback. Synchronize cross-thread
+ownership transfers. Different requests may be accessed concurrently.
 Each returned buffer, error, and snapshot has a matching destroy function in the
 headers.
 
@@ -45,8 +44,11 @@ bytes. Passing zero to the latter uses the Rust client's default (currently
 `tikv_async_client_shutdown_begin` rejects new submissions and lets accepted
 requests finish normally. `tikv_async_client_destroy` begins shutdown, waits for
 all accepted callbacks to return, and releases the client. Stop other calls using
-the client handle before destroying it. Do not destroy a client from one of its
-own callbacks.
+the client handle before destroying it. Do not destroy any client from a
+completion callback, even a callback for a different client: destroying the
+callback's own client can deadlock, and destroying another client's runtime on
+a worker thread can abort the process. Defer client destruction to an application
+thread without waiting for it from the callback.
 
 An empty reverse-scan start key is unsupported by the underlying client.
 Mixed write batches preserve the order of adjacent put and delete phases, but

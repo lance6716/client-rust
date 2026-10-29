@@ -177,7 +177,10 @@ pub unsafe extern "C" fn tikv_async_client_shutdown_begin(
 /// # Safety
 /// A non-null `client` must be a live handle from this library, destroyed
 /// exactly once. All other calls using it must have stopped. This function
-/// must not be called from one of the client's own completion callbacks.
+/// must not be called from any completion callback, even for a different client:
+/// it waits for callbacks and drops a Tokio runtime, which cannot be dropped on
+/// a runtime worker thread. Defer destruction to an application thread without
+/// waiting for it from the callback.
 #[no_mangle]
 pub unsafe extern "C" fn tikv_async_client_destroy(client: *mut tikv_async_client_t) {
     if client.is_null() {

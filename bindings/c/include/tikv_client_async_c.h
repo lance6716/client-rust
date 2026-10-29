@@ -47,9 +47,8 @@ extern "C" {
  *   or after synchronizing with it to observe completion. The callback's
  *   `final_status` is the terminal request status.
  * - The caller must serialize all status/error/result accessor and destroy
- *   calls for the same request, including calls from its callback. Before
- *   handing the request to another thread, finish accessing it and synchronize
- *   the handoff; the callback must not access it again after that handoff.
+ *   calls for the same request, including calls from its callback. Synchronize
+ *   cross-thread ownership transfers.
  *   Different request handles may be accessed concurrently.
  * - Returned buffers and errors are Rust-owned and must be released with the
  *   matching destroy helper from this header.
@@ -60,8 +59,11 @@ extern "C" {
  *   lets accepted requests finish normally.
  * - `tikv_async_client_destroy` begins shutdown, waits for all accepted requests
  *   to finish their callbacks, and then releases the client.
- * - Do not call `tikv_async_client_destroy` from a completion callback belonging
- *   to the same client, or you may deadlock.
+ * - Do not call `tikv_async_client_destroy` from any completion callback, even
+ *   for a different client. Destroying the callback's own client can deadlock;
+ *   destroying another client on a runtime worker thread can abort the process.
+ *   Defer client destruction to an application thread without waiting for it
+ *   from the callback.
  * - Before destroying a client, stop all other calls using its handle.
  */
 
@@ -134,6 +136,7 @@ typedef enum tikv_status_t {
  *
  * The callback may call request result accessors and
  * `tikv_async_request_destroy`.
+ * It must not call `tikv_async_client_destroy` for any client.
  */
 typedef void (*tikv_async_completion_cb)(tikv_async_request_t *request,
                                          tikv_status_t final_status,
@@ -367,6 +370,13 @@ void tikv_kv_pairs_destroy(tikv_kv_pairs_t pairs);
  * Destroying a pending request before its callback starts is invalid.
  */
 void tikv_async_request_destroy(tikv_async_request_t *request);
+
+/*
+ * Release a client after draining its callbacks. NULL is a no-op.
+ *
+ * Must not be called from any completion callback, including a callback for a
+ * different client. See the client shutdown contract above.
+ */
 void tikv_async_client_destroy(tikv_async_client_t *client);
 
 #ifdef __cplusplus
