@@ -765,16 +765,23 @@ impl<PdC: PdClient> Client<PdC> {
             });
         }
         let backoff = DEFAULT_STORE_BACKOFF;
-        let mut range = range.into().encode_keyspace(self.keyspace, KeyMode::Raw);
+        let range = range.into().encode_keyspace(self.keyspace, KeyMode::Raw);
         let mut result = Vec::new();
         let mut current_limit = limit;
-        let (start_key, end_key) = range.clone().into_keys();
-        let mut current_key: Key = start_key;
+        let (range_start, range_end) = range.into_keys();
+        let reverse_unbounded = reverse && range_end.is_none();
+        let mut current_key = if reverse && !reverse_unbounded {
+            range_end.clone().unwrap()
+        } else {
+            range_start.clone()
+        };
 
         while current_limit > 0 {
             let scan_args = ScanInnerArgs {
-                start_key: current_key.clone(),
-                end_key: end_key.clone(),
+                current_key: current_key.clone(),
+                range_start: range_start.clone(),
+                range_end: range_end.clone(),
+                reverse_unbounded,
                 limit: current_limit,
                 key_only,
                 reverse,
@@ -790,15 +797,14 @@ impl<PdC: PdClient> Client<PdC> {
                 current_limit -= kvs.len() as u32;
                 result.append(&mut kvs);
             }
-            if next_key.is_empty() {
+            if reverse && !reverse_unbounded {
+                if next_key.is_empty() || next_key <= range_start {
+                    break;
+                }
+            } else if next_key.is_empty() || range_end.clone().is_some_and(|ek| ek <= next_key) {
                 break;
             }
-            if end_key.clone().is_some_and(|ek| ek <= next_key) {
-                break;
-            } else {
-                current_key = next_key;
-                range = BoundRange::new(std::ops::Bound::Included(current_key.clone()), range.to);
-            }
+            current_key = next_key;
         }
 
         // limit is a soft limit, so we need check the number of results
@@ -814,11 +820,30 @@ impl<PdC: PdClient> Client<PdC> {
         &self,
         mut scan_args: ScanInnerArgs,
     ) -> Result<(Option<RawScanResponse>, Key)> {
-        let start_key = scan_args.start_key;
-        let end_key = scan_args.end_key;
+        let current_key = scan_args.current_key;
         loop {
-            let region = self.rpc.clone().region_for_key(&start_key).await?;
+            let region = if scan_args.reverse && !scan_args.reverse_unbounded {
+                let region = self.rpc.clone().region_for_key(&current_key).await?;
+                if !current_key.is_empty() && region.start_key() == current_key {
+                    self.rpc.clone().prev_region_for_key(&current_key).await?
+                } else {
+                    region
+                }
+            } else {
+                self.rpc.clone().region_for_key(&current_key).await?
+            };
             let store = self.rpc.clone().store_for_id(region.id()).await?;
+            let (start_key, end_key) = if scan_args.reverse && !scan_args.reverse_unbounded {
+                let region_start = region.start_key();
+                let start_key = if region_start < scan_args.range_start {
+                    scan_args.range_start.clone()
+                } else {
+                    region_start
+                };
+                (start_key, Some(current_key.clone()))
+            } else {
+                (current_key.clone(), scan_args.range_end.clone())
+            };
             let request = new_raw_scan_request(
                 (start_key.clone(), end_key.clone()).into(),
                 scan_args.limit,
@@ -842,7 +867,12 @@ impl<PdC: PdClient> Client<PdC> {
                             return Err(RegionError(Box::new(err)));
                         }
                     }
-                    Ok((Some(r), region.end_key()))
+                    let next_key = if scan_args.reverse && !scan_args.reverse_unbounded {
+                        region.start_key()
+                    } else {
+                        region.end_key()
+                    };
+                    Ok((Some(r), next_key))
                 }
                 Err(err) => Err(err),
             };
@@ -910,8 +940,10 @@ impl<PdC: PdClient> Client<PdC> {
 
 #[derive(Clone)]
 struct ScanInnerArgs {
-    start_key: Key,
-    end_key: Option<Key>,
+    current_key: Key,
+    range_start: Key,
+    range_end: Option<Key>,
+    reverse_unbounded: bool,
     limit: u32,
     key_only: bool,
     reverse: bool,
@@ -923,12 +955,76 @@ mod tests {
     use std::any::Any;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::Mutex;
 
     use super::*;
     use crate::mock::MockKvClient;
     use crate::mock::MockPdClient;
     use crate::proto::kvrpcpb;
     use crate::Result;
+
+    #[tokio::test]
+    async fn reverse_scan_across_regions_uses_previous_regions() -> Result<()> {
+        let keys = Arc::new(vec![vec![1], vec![11], vec![251]]);
+        let requests = Arc::new(Mutex::new(Vec::<(Vec<u8>, Vec<u8>)>::new()));
+        let dispatched_keys = keys.clone();
+        let dispatched_requests = requests.clone();
+        let pd_client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |req: &dyn Any| {
+                let req = req.downcast_ref::<kvrpcpb::RawScanRequest>().unwrap();
+                assert!(req.reverse);
+                dispatched_requests
+                    .lock()
+                    .unwrap()
+                    .push((req.start_key.clone(), req.end_key.clone()));
+
+                let kvs = dispatched_keys
+                    .iter()
+                    .filter(|key| key.as_slice() >= req.end_key.as_slice())
+                    .filter(|key| key.as_slice() < req.start_key.as_slice())
+                    .rev()
+                    .map(|key| kvrpcpb::KvPair {
+                        key: key.clone(),
+                        value: key.clone(),
+                        ..Default::default()
+                    })
+                    .collect();
+                Ok(Box::new(kvrpcpb::RawScanResponse {
+                    kvs,
+                    ..Default::default()
+                }) as Box<dyn Any>)
+            },
+        )));
+        let client = Client {
+            rpc: pd_client,
+            cf: None,
+            backoff: DEFAULT_REGION_BACKOFF,
+            atomic: false,
+            keyspace: Keyspace::Disable,
+        };
+
+        let pairs = client.scan_reverse(vec![1]..vec![255], 2).await?;
+        assert_eq!(
+            pairs.into_iter().map(|pair| pair.0).collect::<Vec<_>>(),
+            vec![Key::from(vec![251]), Key::from(vec![11])]
+        );
+        assert_eq!(
+            requests.lock().unwrap().as_slice(),
+            &[(vec![255], vec![250, 250]), (vec![250, 250], vec![10]),]
+        );
+
+        requests.lock().unwrap().clear();
+        let pairs = client.scan_reverse(vec![1]..vec![250, 250], 2).await?;
+        assert_eq!(
+            pairs.into_iter().map(|pair| pair.0).collect::<Vec<_>>(),
+            vec![Key::from(vec![11]), Key::from(vec![1])]
+        );
+        assert_eq!(
+            requests.lock().unwrap().as_slice(),
+            &[(vec![250, 250], vec![10]), (vec![10], vec![1]),]
+        );
+        Ok(())
+    }
 
     #[rstest::rstest]
     #[case::forward(false)]

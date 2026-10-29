@@ -53,6 +53,26 @@ impl Cluster {
         req.send(&mut self.client, timeout).await
     }
 
+    pub async fn get_prev_region(
+        &mut self,
+        key: Vec<u8>,
+        timeout: Duration,
+    ) -> Result<pdpb::GetRegionResponse> {
+        let mut req = pd_request!(self.id, pdpb::GetRegionRequest);
+        req.region_key = key;
+        let mut req = req.into_request();
+        req.set_timeout(timeout);
+        let response = self.client.get_prev_region(req).await?.into_inner();
+        if let Some(err) = &response
+            .header
+            .as_ref()
+            .and_then(|header| header.error.as_ref())
+        {
+            return Err(internal_err!(err.message.clone()));
+        }
+        Ok(response)
+    }
+
     pub async fn get_region_by_id(
         &mut self,
         id: u64,

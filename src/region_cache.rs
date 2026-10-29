@@ -138,6 +138,21 @@ impl<C: RetryClientTrait> RegionCache<C> {
         Ok(region)
     }
 
+    /// Force read through (query from PD) for the region immediately before
+    /// the region containing `key`.
+    pub async fn read_through_prev_region_by_key(&self, key: Key) -> Result<RegionWithLeader>
+    where
+        C: Send + Sync,
+    {
+        let region = self
+            .inner_client
+            .clone()
+            .get_prev_region(key.into())
+            .await?;
+        self.add_region(region.clone()).await;
+        Ok(region)
+    }
+
     /// Force read through (query from PD) and update cache
     async fn read_through_region_by_id(&self, id: RegionId) -> Result<RegionWithLeader> {
         // put a notify to let others know the region id is being queried

@@ -241,6 +241,18 @@ impl PdClient for MockPdClient {
         Ok(region)
     }
 
+    async fn prev_region_for_key(&self, key: &Key) -> Result<RegionWithLeader> {
+        let region = self.region_for_key(key).await?;
+        match region.id() {
+            1 => Err(Error::RegionForKeyNotFound { key: key.to_vec() }),
+            2 => Ok(Self::region1()),
+            3 => Ok(Self::region2()),
+            _ => Err(Error::RegionNotFoundInResponse {
+                region_id: region.id(),
+            }),
+        }
+    }
+
     async fn region_for_id(&self, id: RegionId) -> Result<RegionWithLeader> {
         match id {
             1 => Ok(Self::region1()),

@@ -28,6 +28,7 @@ use crate::store::TikvConnect;
 use crate::store::{KvClient, Store};
 use crate::BoundRange;
 use crate::Config;
+use crate::Error;
 use crate::Key;
 use crate::Result;
 use crate::SecurityManager;
@@ -59,6 +60,13 @@ pub trait PdClient: Send + Sync + 'static {
 
     /// In transactional API, the key and returned region are both decoded (keys in raw format).
     async fn region_for_key(&self, key: &Key) -> Result<RegionWithLeader>;
+
+    /// Return the region immediately before the region containing `key`.
+    ///
+    /// This is used by reverse scans when they reach a region boundary.
+    async fn prev_region_for_key(&self, _key: &Key) -> Result<RegionWithLeader> {
+        Err(Error::Unimplemented)
+    }
 
     /// In transactional API, the returned region is decoded (keys in raw format)
     async fn region_for_id(&self, id: RegionId) -> Result<RegionWithLeader>;
@@ -239,6 +247,21 @@ impl<KvC: KvConnect + Send + Sync + 'static> PdClient for PdRpcClient<KvC> {
         };
 
         let region = self.region_cache.get_region_by_key(&key).await?;
+        Self::decode_region(region, enable_codec)
+    }
+
+    async fn prev_region_for_key(&self, key: &Key) -> Result<RegionWithLeader> {
+        let enable_codec = self.enable_codec;
+        let key = if enable_codec {
+            key.to_encoded()
+        } else {
+            key.clone()
+        };
+
+        let region = self
+            .region_cache
+            .read_through_prev_region_by_key(key)
+            .await?;
         Self::decode_region(region, enable_codec)
     }
 
