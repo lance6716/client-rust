@@ -334,11 +334,6 @@ pub unsafe extern "C" fn tikv_async_raw_scan_reverse_submit(
     }
 
     metrics::binding_metrics().submit(out_error, || {
-        if slice_is_empty(start_key) {
-            return Err(FfiError::invalid_argument(
-                "scan_reverse does not support empty start_key in client-rust",
-            ));
-        }
         let range = slice_to_range(start_key, end_key)?;
         submit_common(
             client,

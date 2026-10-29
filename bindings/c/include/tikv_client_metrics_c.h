@@ -23,7 +23,7 @@ typedef enum tikv_metric_sample_kind_t {
 /*
  * Metric families exported by `tikv_metrics_snapshot_collect`.
  * Request totals are counters; request durations are histograms.
- * FFI submissions and completions are counters; FFI in-flight requests a gauge.
+ * FFI submissions and completions are counters; the in-flight count is a gauge.
  */
 #define TIKV_METRIC_TIKV_REQUEST_TOTAL "tikv_request_total"
 #define TIKV_METRIC_TIKV_REQUEST_DURATION_SECONDS                         \

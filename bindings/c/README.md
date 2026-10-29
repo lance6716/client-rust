@@ -44,15 +44,24 @@ bytes. Passing zero to the latter uses the Rust client's default (currently
 `tikv_async_client_shutdown_begin` rejects new submissions and lets accepted
 requests finish normally. `tikv_async_client_destroy` begins shutdown, waits for
 all accepted callbacks to return, and releases the client. Stop other calls using
-the client handle before destroying it. Do not destroy any client from a
-completion callback, even a callback for a different client: destroying the
-callback's own client can deadlock, and destroying another client's runtime on
-a worker thread can abort the process. Defer client destruction to an application
-thread without waiting for it from the callback.
+the client handle before destroying it. Destruction returns `TIKV_STATUS_OK` on
+success, including for a null handle.
+Client creation and destruction return `TIKV_STATUS_INVALID_ARGUMENT` in a Tokio
+context, including any completion callback. Rejected creation leaves the output
+client null; rejected destruction leaves the client unchanged for retry. Defer
+these operations to an application thread; a callback must not wait for that
+thread to drain its own client.
 
-An empty reverse-scan start key is unsupported by the underlying client.
+Reverse scans pass empty bounds through to the Rust client's keyspace encoding.
 Mixed write batches preserve the order of adjacent put and delete phases, but
 may issue multiple TiKV requests.
+
+With a running cluster, the callback lifecycle regression test runs with the
+workspace's `integration-tests` feature and `PD_ADDRS` setting:
+
+```sh
+cargo test -p tikv-client-rust-c --features integration-tests raw_callback
+```
 
 ## Metrics snapshots
 

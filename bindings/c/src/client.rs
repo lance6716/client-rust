@@ -61,6 +61,11 @@ fn new_client_handle(
     use_default_keyspace: bool,
     grpc_max_decoding_message_size: usize,
 ) -> FfiResult<AsyncClientHandle> {
+    if Handle::try_current().is_ok() {
+        return Err(FfiError::invalid_argument(
+            "client creation cannot run in a Tokio context (including completion callbacks)",
+        ));
+    }
     let endpoints = parse_pd_endpoints(pd_endpoints_csv)?;
     let config = build_config(
         timeout_secs,
@@ -175,16 +180,20 @@ pub unsafe extern "C" fn tikv_async_client_shutdown_begin(
 }
 
 /// # Safety
-/// A non-null `client` must be a live handle from this library, destroyed
-/// exactly once. All other calls using it must have stopped. This function
-/// must not be called from any completion callback, even for a different client:
-/// it waits for callbacks and drops a Tokio runtime, which cannot be dropped on
-/// a runtime worker thread. Defer destruction to an application thread without
-/// waiting for it from the callback.
+/// A non-null `client` must be a live handle from this library. Before successful
+/// destruction, all other calls using it must have stopped. Destroy it exactly
+/// once successfully; `TIKV_STATUS_INVALID_ARGUMENT` leaves the handle unchanged.
 #[no_mangle]
-pub unsafe extern "C" fn tikv_async_client_destroy(client: *mut tikv_async_client_t) {
+pub unsafe extern "C" fn tikv_async_client_destroy(
+    client: *mut tikv_async_client_t,
+) -> tikv_status_t {
     if client.is_null() {
-        return;
+        return tikv_status_t::TIKV_STATUS_OK;
+    }
+    // Check before taking ownership or beginning shutdown. This also rejects
+    // destruction of a different client from a completion callback.
+    if Handle::try_current().is_ok() {
+        return tikv_status_t::TIKV_STATUS_INVALID_ARGUMENT;
     }
     let handle = unsafe { Box::from_raw(client as *mut AsyncClientHandle) };
     handle
@@ -193,4 +202,95 @@ pub unsafe extern "C" fn tikv_async_client_destroy(client: *mut tikv_async_clien
         .accepting
         .store(false, Ordering::Release);
     wait_drain(&handle.core.lifecycle);
+    drop(handle);
+    tikv_status_t::TIKV_STATUS_OK
+}
+
+#[cfg(all(test, feature = "integration-tests"))]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    struct CallbackContext {
+        clients: [*mut tikv_async_client_t; 2],
+        reports: mpsc::Sender<([tikv_status_t; 4], bool)>,
+    }
+
+    extern "C" fn check_client_lifecycle(
+        request: *mut tikv_async_request_t,
+        status: tikv_status_t,
+        userdata: *mut c_void,
+    ) {
+        let context = unsafe { &*(userdata as *const CallbackContext) };
+        let mut created = ptr::null_mut();
+        // Exercise the public ABI on a real completion worker, including
+        // destruction of both the callback's client and an unrelated client.
+        let statuses = unsafe {
+            [
+                status,
+                tikv_async_client_new(
+                    c"127.0.0.1:1".as_ptr(),
+                    1,
+                    false,
+                    &mut created,
+                    ptr::null_mut(),
+                ),
+                tikv_async_client_destroy(context.clients[0]),
+                tikv_async_client_destroy(context.clients[1]),
+            ]
+        };
+        unsafe { tikv_async_request_destroy(request) };
+        let _ = context.reports.send((statuses, created.is_null()));
+    }
+
+    #[test]
+    fn raw_callback_rejects_client_lifecycle_calls_without_changing_clients() {
+        let endpoints =
+            CString::new(std::env::var("PD_ADDRS").unwrap_or_else(|_| "127.0.0.1:2379".to_owned()))
+                .unwrap();
+        let clients = std::array::from_fn(|_| {
+            let mut client = ptr::null_mut();
+            assert_eq!(
+                unsafe {
+                    tikv_async_client_new(endpoints.as_ptr(), 5, true, &mut client, ptr::null_mut())
+                },
+                tikv_status_t::TIKV_STATUS_OK,
+            );
+            client
+        });
+        let (reports, receiver) = mpsc::channel();
+        let context = CallbackContext { clients, reports };
+        // Reusing both handles proves rejected destruction neither consumes
+        // them nor begins shutdown. Repeat on the first client to test self-use.
+        for client in [clients[0], clients[0], clients[1]] {
+            let mut request = ptr::null_mut();
+            assert_eq!(
+                unsafe {
+                    tikv_async_raw_get_submit(
+                        client,
+                        tikv_slice_t {
+                            ptr: b"lifecycle-test".as_ptr(),
+                            len: 14,
+                        },
+                        Some(check_client_lifecycle),
+                        &context as *const _ as *mut c_void,
+                        &mut request,
+                        ptr::null_mut(),
+                    )
+                },
+                tikv_status_t::TIKV_STATUS_OK,
+            );
+            let (statuses, outputs_null) = receiver.recv_timeout(Duration::from_secs(10)).unwrap();
+            let mut expected = [tikv_status_t::TIKV_STATUS_INVALID_ARGUMENT; 4];
+            expected[0] = tikv_status_t::TIKV_STATUS_OK;
+            assert_eq!(statuses, expected);
+            assert!(outputs_null);
+        }
+        for client in clients {
+            assert_eq!(
+                unsafe { tikv_async_client_destroy(client) },
+                tikv_status_t::TIKV_STATUS_OK,
+            );
+        }
+    }
 }

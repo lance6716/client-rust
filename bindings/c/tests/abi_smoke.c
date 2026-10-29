@@ -12,6 +12,7 @@
 int main(void) {
   tikv_async_client_t *client = NULL;
   tikv_error_t *error = NULL;
+  assert(tikv_async_client_destroy(NULL) == TIKV_STATUS_OK);
 
   /* Invalid endpoints fail before connecting to PD. Check enum return values,
    * output pointers, and Rust-owned error strings across the C ABI.

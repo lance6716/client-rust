@@ -20,9 +20,10 @@
 //! and destruction must be serialized, in the callback or after synchronizing
 //! with it; a request handle must be destroyed exactly once. A callback may run
 //! and destroy the handle before submission returns.
-//! Callbacks must not call `tikv_async_client_destroy` for any client. Defer
-//! client destruction to an application thread without waiting for it from the
-//! callback.
+//! Client creation and destruction return `TIKV_STATUS_INVALID_ARGUMENT` in a
+//! Tokio context, including completion callbacks. Rejected destruction leaves
+//! the client unchanged. Defer these operations to an application thread;
+//! callbacks must not wait for that thread to drain their own client.
 
 #![allow(non_camel_case_types)]
 #![deny(unsafe_op_in_unsafe_fn)]

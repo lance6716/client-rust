@@ -59,11 +59,10 @@ extern "C" {
  *   lets accepted requests finish normally.
  * - `tikv_async_client_destroy` begins shutdown, waits for all accepted requests
  *   to finish their callbacks, and then releases the client.
- * - Do not call `tikv_async_client_destroy` from any completion callback, even
- *   for a different client. Destroying the callback's own client can deadlock;
- *   destroying another client on a runtime worker thread can abort the process.
- *   Defer client destruction to an application thread without waiting for it
- *   from the callback.
+ * - Client creation and destruction return `TIKV_STATUS_INVALID_ARGUMENT` in a
+ *   Tokio context, including any completion callback. Rejected destruction
+ *   leaves the client unchanged. Defer these operations to an application
+ *   thread; a callback must not wait for that thread to drain its own client.
  * - Before destroying a client, stop all other calls using its handle.
  */
 
@@ -136,7 +135,7 @@ typedef enum tikv_status_t {
  *
  * The callback may call request result accessors and
  * `tikv_async_request_destroy`.
- * It must not call `tikv_async_client_destroy` for any client.
+ * Client creation and destruction are rejected here; see the shutdown contract.
  */
 typedef void (*tikv_async_completion_cb)(tikv_async_request_t *request,
                                          tikv_status_t final_status,
@@ -150,6 +149,8 @@ typedef void (*tikv_async_completion_cb)(tikv_async_request_t *request,
  * `use_default_keyspace` enables API v2 default keyspace configuration.
  * For compatibility, this constructor has no gRPC response decoding limit.
  * Use the constructor below to choose a limit explicitly.
+ * Returns `TIKV_STATUS_INVALID_ARGUMENT` in a Tokio context (including completion
+ * callbacks), leaving `*out_client` NULL. Use an application thread instead.
  */
 tikv_status_t tikv_async_client_new(const char *pd_endpoints_csv,
                                     uint32_t timeout_secs,
@@ -162,6 +163,7 @@ tikv_status_t tikv_async_client_new(const char *pd_endpoints_csv,
  *
  * `grpc_max_decoding_message_size == 0` uses the Rust client's default
  * (currently 4 MiB). Larger responses require an explicit limit.
+ * The same threading restriction as `tikv_async_client_new` applies.
  */
 tikv_status_t tikv_async_client_new_with_grpc_max_decoding_message_size(
     const char *pd_endpoints_csv,
@@ -260,8 +262,8 @@ tikv_status_t tikv_async_raw_scan_submit(const tikv_async_client_t *client,
  * This maps to `client-rust` raw `scan_reverse`.
  * The returned pairs are in reverse lexicographical key order.
  *
- * Note: the underlying raw client does not support reverse scan from an empty
- * start key because locating the last region is not implemented.
+ * The range is [start_key, end_key); an empty end_key means no upper bound.
+ * Empty bounds are passed through to the Rust client for keyspace encoding.
  */
 tikv_status_t
  tikv_async_raw_scan_reverse_submit(const tikv_async_client_t *client,
@@ -372,12 +374,14 @@ void tikv_kv_pairs_destroy(tikv_kv_pairs_t pairs);
 void tikv_async_request_destroy(tikv_async_request_t *request);
 
 /*
- * Release a client after draining its callbacks. NULL is a no-op.
+ * Release a client after draining its callbacks. Returns `TIKV_STATUS_OK` on
+ * success, including for NULL (a no-op).
  *
- * Must not be called from any completion callback, including a callback for a
- * different client. See the client shutdown contract above.
+ * Returns `TIKV_STATUS_INVALID_ARGUMENT` in a Tokio context, including any
+ * completion callback, leaving the client unchanged. Retry on an application
+ * thread. Stop all other calls using the handle before successful destruction.
  */
-void tikv_async_client_destroy(tikv_async_client_t *client);
+tikv_status_t tikv_async_client_destroy(tikv_async_client_t *client);
 
 #ifdef __cplusplus
 }

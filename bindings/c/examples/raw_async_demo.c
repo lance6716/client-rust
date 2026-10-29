@@ -309,6 +309,5 @@ int main(int argc, char **argv) {
     tikv_async_client_destroy(client);
     return 1;
   }
-  tikv_async_client_destroy(client);
-  return 0;
+  return expect_ok("client_destroy", tikv_async_client_destroy(client), NULL) ? 0 : 1;
 }
