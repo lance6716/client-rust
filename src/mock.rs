@@ -86,6 +86,10 @@ pub struct MockPdClient {
     #[new(default)]
     region_for_key_hook:
         Option<Arc<dyn Fn(&Key) -> Result<RegionWithLeader> + Send + Sync + 'static>>,
+    /// Optional override for `prev_region_for_key`.
+    #[new(default)]
+    prev_region_for_key_hook:
+        Option<Arc<dyn Fn(&Key) -> Result<RegionWithLeader> + Send + Sync + 'static>>,
     /// Optional observer/override for leader cache updates.
     #[new(default)]
     update_leader_hook:
@@ -137,6 +141,14 @@ impl MockPdClient {
         F: Fn(&Key) -> Result<RegionWithLeader> + Send + Sync + 'static,
     {
         self.region_for_key_hook = Some(Arc::new(hook));
+        self
+    }
+
+    pub fn with_prev_region_for_key_hook<F>(mut self, hook: F) -> MockPdClient
+    where
+        F: Fn(&Key) -> Result<RegionWithLeader> + Send + Sync + 'static,
+    {
+        self.prev_region_for_key_hook = Some(Arc::new(hook));
         self
     }
 
@@ -242,6 +254,9 @@ impl PdClient for MockPdClient {
     }
 
     async fn prev_region_for_key(&self, key: &Key) -> Result<RegionWithLeader> {
+        if let Some(hook) = &self.prev_region_for_key_hook {
+            return hook(key);
+        }
         let region = self.region_for_key(key).await?;
         match region.id() {
             1 => Err(Error::RegionForKeyNotFound { key: key.to_vec() }),

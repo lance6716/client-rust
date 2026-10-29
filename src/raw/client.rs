@@ -769,7 +769,13 @@ impl<PdC: PdClient> Client<PdC> {
         let mut result = Vec::new();
         let mut current_limit = limit;
         let (range_start, range_end) = range.into_keys();
-        let reverse_unbounded = reverse && range_end.is_none();
+        // `encode_keyspace` represents an unbounded upper bound as an empty key
+        // when keyspace prefixes are disabled. Keyspace-enabled ranges use the
+        // next keyspace prefix instead, so their encoded upper bound is non-empty.
+        let reverse_unbounded = reverse
+            && (range_end.is_none()
+                || (range_end.as_ref().is_some_and(Key::is_empty)
+                    && !matches!(self.keyspace, Keyspace::Enable { .. })));
         let mut current_key = if reverse && !reverse_unbounded {
             range_end.clone().unwrap()
         } else {
@@ -825,7 +831,18 @@ impl<PdC: PdClient> Client<PdC> {
             let region = if scan_args.reverse && !scan_args.reverse_unbounded {
                 let region = self.rpc.clone().region_for_key(&current_key).await?;
                 if !current_key.is_empty() && region.start_key() == current_key {
-                    self.rpc.clone().prev_region_for_key(&current_key).await?
+                    let previous = match self.rpc.clone().prev_region_for_key(&current_key).await {
+                        Ok(previous) if previous.end_key() == current_key => previous,
+                        Ok(_) | Err(Error::RegionForKeyNotFound { .. }) => {
+                            // The cached containing region is stale (for example,
+                            // after a merge), so the predecessor no longer ends
+                            // at this cursor. Drop it and resolve the cursor again.
+                            self.rpc.invalidate_region_cache(region.ver_id()).await;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    previous
                 } else {
                     region
                 }
@@ -953,7 +970,7 @@ struct ScanInnerArgs {
 #[cfg(test)]
 mod tests {
     use std::any::Any;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::sync::Mutex;
 
@@ -1022,6 +1039,103 @@ mod tests {
         assert_eq!(
             requests.lock().unwrap().as_slice(),
             &[(vec![250, 250], vec![10]), (vec![10], vec![1]),]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reverse_scan_from_unbounded_upper_bound_uses_range_start() -> Result<()> {
+        let looked_up_keys = Arc::new(Mutex::new(Vec::<Key>::new()));
+        let dispatched_lookups = looked_up_keys.clone();
+        let pd_client = Arc::new(
+            MockPdClient::new(MockKvClient::with_dispatch_hook(move |req: &dyn Any| {
+                let req = req.downcast_ref::<kvrpcpb::RawScanRequest>().unwrap();
+                assert!(req.reverse);
+                assert!(req.start_key.is_empty());
+                assert_eq!(req.end_key, vec![251]);
+                Ok(Box::new(kvrpcpb::RawScanResponse {
+                    kvs: vec![kvrpcpb::KvPair {
+                        key: vec![251],
+                        value: vec![42],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }) as Box<dyn Any>)
+            }))
+            .with_region_for_key_hook(move |key| {
+                dispatched_lookups.lock().unwrap().push(key.clone());
+                Ok(MockPdClient::region3())
+            }),
+        );
+        let client = Client {
+            rpc: pd_client,
+            cf: None,
+            backoff: DEFAULT_REGION_BACKOFF,
+            atomic: false,
+            keyspace: Keyspace::Disable,
+        };
+
+        assert_eq!(client.scan_reverse(vec![251].., 1).await?.len(), 1);
+        assert_eq!(
+            looked_up_keys.lock().unwrap().as_slice(),
+            &[Key::from(vec![251])]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reverse_scan_refreshes_stale_region_boundary() -> Result<()> {
+        let refreshed = Arc::new(AtomicBool::new(false));
+        let invalidations = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(Mutex::new(Vec::<(Vec<u8>, Vec<u8>)>::new()));
+        let region_refreshed = refreshed.clone();
+        let invalidation_count = invalidations.clone();
+        let dispatched_requests = requests.clone();
+        let stale_region = MockPdClient::region3();
+        let mut merged_region = MockPdClient::region3();
+        merged_region.region.start_key = vec![10];
+        merged_region.region.region_epoch.as_mut().unwrap().version = 1;
+        let merged_region_for_lookup = merged_region.clone();
+        let pd_client = Arc::new(
+            MockPdClient::new(MockKvClient::with_dispatch_hook(move |req: &dyn Any| {
+                let req = req.downcast_ref::<kvrpcpb::RawScanRequest>().unwrap();
+                dispatched_requests
+                    .lock()
+                    .unwrap()
+                    .push((req.start_key.clone(), req.end_key.clone()));
+                Ok(Box::new(kvrpcpb::RawScanResponse::default()) as Box<dyn Any>)
+            }))
+            .with_region_for_key_hook(move |key| {
+                if region_refreshed.load(Ordering::SeqCst) {
+                    let key_bytes: &[u8] = key.into();
+                    if key_bytes >= [10].as_slice() {
+                        Ok(merged_region_for_lookup.clone())
+                    } else {
+                        Ok(MockPdClient::region1())
+                    }
+                } else {
+                    Ok(stale_region.clone())
+                }
+            })
+            .with_prev_region_for_key_hook(|_| Ok(MockPdClient::region1()))
+            .with_invalidate_region_hook(move |_| {
+                invalidation_count.fetch_add(1, Ordering::SeqCst);
+                refreshed.store(true, Ordering::SeqCst);
+            }),
+        );
+        let client = Client {
+            rpc: pd_client,
+            cf: None,
+            backoff: DEFAULT_REGION_BACKOFF,
+            atomic: false,
+            keyspace: Keyspace::Disable,
+        };
+
+        client.scan_reverse(vec![1]..vec![250, 250], 1).await?;
+        assert_eq!(invalidations.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            requests.lock().unwrap().as_slice(),
+            &[(vec![250, 250], vec![10]), (vec![10], vec![1])]
         );
         Ok(())
     }

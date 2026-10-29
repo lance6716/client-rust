@@ -144,11 +144,25 @@ impl<C: RetryClientTrait> RegionCache<C> {
     where
         C: Send + Sync,
     {
-        let region = self
+        let mut region = self
             .inner_client
             .clone()
             .get_prev_region(key.into())
             .await?;
+
+        // A reverse scan may refresh the predecessor after TiKV has supplied a
+        // more recent NotLeader hint. Preserve that corrected leader when PD
+        // returns the same region version again.
+        let cached_leader = {
+            let cache = self.region_cache.read().await;
+            cache
+                .ver_id_to_region
+                .get(&region.ver_id())
+                .and_then(|cached| cached.leader.clone())
+        };
+        if cached_leader.is_some() {
+            region.leader = cached_leader;
+        }
         self.add_region(region.clone()).await;
         Ok(region)
     }
@@ -339,6 +353,20 @@ mod test {
                 .map(|(_, r)| r.clone())
                 .next()
                 .ok_or_else(|| Error::StringError("MockRetryClient: region not found".to_owned()))
+        }
+
+        async fn get_prev_region(
+            self: Arc<Self>,
+            key: Vec<u8>,
+        ) -> Result<crate::region::RegionWithLeader> {
+            self.get_region_count.fetch_add(1, SeqCst);
+            self.regions
+                .lock()
+                .await
+                .values()
+                .find(|r| r.end_key() == key.clone().into())
+                .cloned()
+                .ok_or_else(|| Error::RegionForKeyNotFound { key })
         }
 
         async fn get_region_by_id(
@@ -544,6 +572,48 @@ mod test {
         assert!(cache.get_region_by_key(&vec![20].into()).await.is_err());
         assert!(cache.get_region_by_key(&vec![25].into()).await.is_err());
         assert_eq!(cache.get_region_by_key(&vec![60].into()).await?, region4);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_prev_region_preserves_cached_leader() -> Result<()> {
+        let retry_client = Arc::new(MockRetryClient::default());
+        let cache = RegionCache::new(retry_client.clone());
+        let mut pd_region = region(1, vec![], vec![10]);
+        pd_region.leader = Some(metapb::Peer {
+            store_id: 41,
+            ..Default::default()
+        });
+        retry_client
+            .regions
+            .lock()
+            .await
+            .insert(pd_region.id(), pd_region.clone());
+
+        cache.add_region(pd_region.clone()).await;
+        cache
+            .update_leader(
+                pd_region.ver_id(),
+                metapb::Peer {
+                    store_id: 42,
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        let refreshed = cache
+            .read_through_prev_region_by_key(vec![10].into())
+            .await?;
+        assert_eq!(refreshed.leader.unwrap().store_id, 42);
+        assert_eq!(
+            cache
+                .get_region_by_id(pd_region.id())
+                .await?
+                .leader
+                .unwrap()
+                .store_id,
+            42
+        );
         Ok(())
     }
 
