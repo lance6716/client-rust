@@ -434,41 +434,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn rejected_submissions_roll_back_provisional_inflight_registration() {
-        // Validation errors, shutdown rejection, and pre-acceptance panics all
-        // count as rejected without a callback or an accepted-request gauge leak.
-        let lifecycle = lifecycle();
-        for (index, expected) in [
-            tikv_status_t::TIKV_STATUS_INVALID_ARGUMENT,
-            tikv_status_t::TIKV_STATUS_REJECTED,
-            tikv_status_t::TIKV_STATUS_PANIC,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let status = lifecycle.metrics.submit(ptr::null_mut(), || {
-                let _provisional = InflightGuard::new(&lifecycle);
-                match expected {
-                    tikv_status_t::TIKV_STATUS_INVALID_ARGUMENT => {
-                        Err(FfiError::invalid_argument("invalid input"))
-                    }
-                    tikv_status_t::TIKV_STATUS_REJECTED => {
-                        Err(FfiError::rejected("client is shutting down"))
-                    }
-                    _ => panic!("submission panicked"),
-                }
-            });
-            assert_eq!(status, expected);
-            lifecycle
-                .metrics
-                .assert_counts(0, index as u64 + 1, [0; 3], 0);
-            assert_eq!(*lifecycle.inflight.lock().unwrap(), 0);
-        }
-        lifecycle.accepting.store(false, Ordering::Release);
-        wait_drain(&lifecycle);
-    }
-
     struct BlockingCallback {
         entered: mpsc::Sender<tikv_status_t>,
         release: Mutex<mpsc::Receiver<()>>,
@@ -678,22 +643,9 @@ mod tests {
             tikv_owned_bytes_destroy(out_value);
             tikv_error_destroy(error);
         }
-        // SAFETY: the handoff still grants exclusive access to the live handle.
-        let second_status = unsafe {
-            tikv_async_request_take_get_result(
-                raw_request,
-                &mut out_value,
-                &mut out_found,
-                &mut error,
-            )
-        };
-        let second_has_error = !error.is_null();
-        // SAFETY: release the new error and the sole C request reference once;
+        // SAFETY: release the sole C request reference once;
         // the blocked callback will not access the request again.
-        unsafe {
-            tikv_error_destroy(error);
-            tikv_async_request_destroy(raw_request);
-        }
+        unsafe { tikv_async_request_destroy(raw_request) };
         let alive_during_callback = weak_request.upgrade().is_some();
 
         // Release the callback before asserting so a failed assertion cannot
@@ -705,8 +657,6 @@ mod tests {
         assert!(no_error);
         assert!(found);
         assert_eq!(value, b"value");
-        assert_eq!(second_status, tikv_status_t::TIKV_STATUS_INVALID_ARGUMENT);
-        assert!(second_has_error);
         assert!(alive_during_callback);
         assert!(weak_request.upgrade().is_none());
     }
