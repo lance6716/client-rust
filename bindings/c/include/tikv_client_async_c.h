@@ -20,6 +20,9 @@ extern "C" {
  * - Copy every cross-async-boundary input before submit returns.
  * - Make shutdown and request ownership explicit.
  *
+ * Keys and values are binary; NUL bytes are preserved. Range operations use
+ * [start_key, end_key), with no upper bound only when end_key.len == 0.
+ *
  * Threading model:
  *
  * - Submit functions may be called concurrently on the same client handle.

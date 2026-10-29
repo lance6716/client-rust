@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::request::submit_common;
+use std::ops::Bound;
 
 fn slices_to_keys(raw: tikv_slices_t, name: &str) -> FfiResult<Vec<Key>> {
     let slices = slices_to_vec(raw.ptr, raw.len, name)?;
@@ -84,11 +85,13 @@ pub(crate) fn build_write_batch_runs(mutations: Vec<OwnedMutation>) -> Vec<Write
 fn slice_to_range(start_key: tikv_slice_t, end_key: tikv_slice_t) -> FfiResult<BoundRange> {
     let start = slice_to_key(start_key, "start_key")?;
     let end = if slice_is_empty(end_key) {
-        None
+        Bound::Unbounded
     } else {
-        Some(slice_to_key(end_key, "end_key")?)
+        Bound::Excluded(slice_to_key(end_key, "end_key")?)
     };
-    Ok(BoundRange::from((start, end)))
+    // Tuple conversion strips trailing NULs and turns b"\0" into an inclusive
+    // empty upper bound, which keyspace encoding interprets as unbounded.
+    Ok(BoundRange::new(Bound::Included(start), end))
 }
 
 async fn submit_put_batch(client: &RawClient, puts: Vec<KvPair>) -> FfiResult<()> {
@@ -426,4 +429,27 @@ pub unsafe extern "C" fn tikv_async_raw_batch_get_submit(
             },
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ops::RangeBounds;
+
+    #[test]
+    fn range_preserves_binary_exclusive_endpoints() {
+        let as_slice = |bytes: &[u8]| tikv_slice_t {
+            ptr: bytes.as_ptr(),
+            len: bytes.len(),
+        };
+        let empty = as_slice(b"");
+        for end in [b"\0".as_slice(), b"a\0".as_slice()] {
+            let range = slice_to_range(empty, as_slice(end)).unwrap();
+            assert!(range.contains(&Key::EMPTY));
+            assert!(!range.contains(&Key::from(end.to_vec())));
+            assert!(!range.contains(&Key::from(b"z".to_vec())));
+        }
+        let unbounded = slice_to_range(empty, empty).unwrap();
+        assert!(unbounded.contains(&Key::from(b"z".to_vec())));
+    }
 }
