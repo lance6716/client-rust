@@ -517,7 +517,8 @@ impl<PdC: PdClient> Client<PdC> {
     /// from startKey(lowerBound) to endKey(upperBound) in reverse order, up to limit pairs.
     /// The returned keys are in reversed lexicographical order.
     /// If you want to include the endKey or exclude the startKey, push a '\0' to the key.
-    /// It doesn't support Scanning from "", because locating the last Region is not yet implemented.
+    /// An unbounded upper bound is supported by locating the final Region before
+    /// traversing Regions backwards toward the lower bound.
     /// # Examples
     /// ```rust,no_run
     /// # use tikv_client::{KvPair, Config, RawClient, IntoOwnedRange};
@@ -772,7 +773,7 @@ impl<PdC: PdClient> Client<PdC> {
         // `encode_keyspace` represents an unbounded upper bound as an empty key
         // when keyspace prefixes are disabled. Keyspace-enabled ranges use the
         // next keyspace prefix instead, so their encoded upper bound is non-empty.
-        let reverse_unbounded = reverse
+        let mut reverse_unbounded = reverse
             && (range_end.is_none()
                 || (range_end.as_ref().is_some_and(Key::is_empty)
                     && !matches!(self.keyspace, Keyspace::Enable { .. })));
@@ -781,6 +782,11 @@ impl<PdC: PdClient> Client<PdC> {
         } else {
             range_start.clone()
         };
+        let mut initial_region = if reverse_unbounded {
+            Some(self.last_region_for_key(&range_start).await?)
+        } else {
+            None
+        };
 
         while current_limit > 0 {
             let scan_args = ScanInnerArgs {
@@ -788,6 +794,7 @@ impl<PdC: PdClient> Client<PdC> {
                 range_start: range_start.clone(),
                 range_end: range_end.clone(),
                 reverse_unbounded,
+                initial_region: initial_region.take(),
                 limit: current_limit,
                 key_only,
                 reverse,
@@ -807,6 +814,14 @@ impl<PdC: PdClient> Client<PdC> {
                 if next_key.is_empty() || next_key <= range_start {
                     break;
                 }
+            } else if reverse_unbounded {
+                if next_key.is_empty() || next_key <= range_start {
+                    break;
+                }
+                // The first request used the final region with an unbounded
+                // upper edge. Subsequent requests walk bounded regions back
+                // toward the lower edge just like an ordinary reverse scan.
+                reverse_unbounded = false;
             } else if next_key.is_empty() || range_end.clone().is_some_and(|ek| ek <= next_key) {
                 break;
             }
@@ -822,13 +837,35 @@ impl<PdC: PdClient> Client<PdC> {
         Ok(result)
     }
 
+    async fn last_region_for_key(&self, key: &Key) -> Result<crate::region::RegionWithLeader> {
+        let mut region = self.rpc.clone().region_for_key(key).await?;
+        loop {
+            let end_key = region.end_key();
+            if end_key.is_empty() {
+                return Ok(region);
+            }
+
+            let next_region = self.rpc.clone().region_for_key(&end_key).await?;
+            if next_region.start_key() != end_key {
+                self.rpc.invalidate_region_cache(region.ver_id()).await;
+                self.rpc.invalidate_region_cache(next_region.ver_id()).await;
+                region = self.rpc.clone().region_for_key(key).await?;
+                continue;
+            }
+            region = next_region;
+        }
+    }
+
     async fn retryable_scan(
         &self,
         mut scan_args: ScanInnerArgs,
     ) -> Result<(Option<RawScanResponse>, Key)> {
         let current_key = scan_args.current_key;
+        let mut region_override = scan_args.initial_region.take();
         loop {
-            let region = if scan_args.reverse && !scan_args.reverse_unbounded {
+            let region = if let Some(region) = region_override.take() {
+                region
+            } else if scan_args.reverse && !scan_args.reverse_unbounded {
                 let region = self.rpc.clone().region_for_key(&current_key).await?;
                 if !current_key.is_empty() && region.start_key() == current_key {
                     let previous = match self.rpc.clone().prev_region_for_key(&current_key).await {
@@ -850,14 +887,18 @@ impl<PdC: PdClient> Client<PdC> {
                 self.rpc.clone().region_for_key(&current_key).await?
             };
             let store = self.rpc.clone().store_for_id(region.id()).await?;
-            let (start_key, end_key) = if scan_args.reverse && !scan_args.reverse_unbounded {
+            let (start_key, end_key) = if scan_args.reverse {
                 let region_start = region.start_key();
                 let start_key = if region_start < scan_args.range_start {
                     scan_args.range_start.clone()
                 } else {
                     region_start
                 };
-                (start_key, Some(current_key.clone()))
+                if scan_args.reverse_unbounded {
+                    (start_key, None)
+                } else {
+                    (start_key, Some(current_key.clone()))
+                }
             } else {
                 (current_key.clone(), scan_args.range_end.clone())
             };
@@ -876,15 +917,22 @@ impl<PdC: PdClient> Client<PdC> {
                             plan::handle_region_error(self.rpc.clone(), err.clone(), store.clone())
                                 .await?;
                         if status {
+                            if scan_args.reverse {
+                                region_override = Some(region.clone());
+                            }
                             continue;
                         } else if let Some(duration) = scan_args.backoff.next_delay_duration() {
+                            if scan_args.reverse_unbounded {
+                                region_override =
+                                    Some(self.last_region_for_key(&scan_args.range_start).await?);
+                            }
                             sleep(duration).await;
                             continue;
                         } else {
                             return Err(RegionError(Box::new(err)));
                         }
                     }
-                    let next_key = if scan_args.reverse && !scan_args.reverse_unbounded {
+                    let next_key = if scan_args.reverse {
                         region.start_key()
                     } else {
                         region.end_key()
@@ -961,6 +1009,7 @@ struct ScanInnerArgs {
     range_start: Key,
     range_end: Option<Key>,
     reverse_unbounded: bool,
+    initial_region: Option<crate::region::RegionWithLeader>,
     limit: u32,
     key_only: bool,
     reverse: bool,
@@ -1079,6 +1128,57 @@ mod tests {
         assert_eq!(
             looked_up_keys.lock().unwrap().as_slice(),
             &[Key::from(vec![251])]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reverse_scan_unbounded_upper_traverses_from_final_region() -> Result<()> {
+        let requests = Arc::new(Mutex::new(Vec::<(Vec<u8>, Vec<u8>)>::new()));
+        let dispatched_requests = requests.clone();
+        let pd_client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |req: &dyn Any| {
+                let req = req.downcast_ref::<kvrpcpb::RawScanRequest>().unwrap();
+                assert!(req.reverse);
+                dispatched_requests
+                    .lock()
+                    .unwrap()
+                    .push((req.start_key.clone(), req.end_key.clone()));
+                let key = match (req.start_key.as_slice(), req.end_key.as_slice()) {
+                    ([], [250, 250]) => vec![251],
+                    ([250, 250], [10]) => vec![11],
+                    request => panic!("unexpected reverse scan request: {request:?}"),
+                };
+                Ok(Box::new(kvrpcpb::RawScanResponse {
+                    kvs: vec![kvrpcpb::KvPair {
+                        key: key.clone(),
+                        value: key,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }) as Box<dyn Any>)
+            },
+        )));
+        let client = Client {
+            rpc: pd_client,
+            cf: None,
+            backoff: DEFAULT_REGION_BACKOFF,
+            atomic: false,
+            keyspace: Keyspace::Disable,
+        };
+
+        assert_eq!(
+            client
+                .scan_reverse(vec![1].., 2)
+                .await?
+                .into_iter()
+                .map(|pair| pair.0)
+                .collect::<Vec<_>>(),
+            vec![Key::from(vec![251]), Key::from(vec![11])]
+        );
+        assert_eq!(
+            requests.lock().unwrap().as_slice(),
+            &[(vec![], vec![250, 250]), (vec![250, 250], vec![10])]
         );
         Ok(())
     }
