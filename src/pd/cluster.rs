@@ -41,6 +41,11 @@ macro_rules! pd_request {
     }};
 }
 
+enum RegionRequestKind {
+    Current,
+    Previous,
+}
+
 // These methods make a single attempt to make a request.
 impl Cluster {
     pub async fn get_region(
@@ -50,7 +55,8 @@ impl Cluster {
     ) -> Result<pdpb::GetRegionResponse> {
         let mut req = pd_request!(self.id, pdpb::GetRegionRequest);
         req.region_key = key;
-        req.send(&mut self.client, timeout).await
+        self.send_region_request(req, timeout, RegionRequestKind::Current)
+            .await
     }
 
     pub async fn get_prev_region(
@@ -60,9 +66,23 @@ impl Cluster {
     ) -> Result<pdpb::GetRegionResponse> {
         let mut req = pd_request!(self.id, pdpb::GetRegionRequest);
         req.region_key = key;
-        let mut req = req.into_request();
+        self.send_region_request(req, timeout, RegionRequestKind::Previous)
+            .await
+    }
+
+    async fn send_region_request(
+        &mut self,
+        request: pdpb::GetRegionRequest,
+        timeout: Duration,
+        kind: RegionRequestKind,
+    ) -> Result<pdpb::GetRegionResponse> {
+        let mut req = request.into_request();
         req.set_timeout(timeout);
-        let response = self.client.get_prev_region(req).await?.into_inner();
+        let response = match kind {
+            RegionRequestKind::Current => self.client.get_region(req).await?,
+            RegionRequestKind::Previous => self.client.get_prev_region(req).await?,
+        }
+        .into_inner();
         if let Some(err) = &response
             .header
             .as_ref()

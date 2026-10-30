@@ -255,14 +255,7 @@ impl<KvC: KvConnect + Send + Sync + 'static> PdClient for PdRpcClient<KvC> {
             key.clone()
         };
 
-        if let Some(region) = self.region_cache.get_prev_region_by_key(&key).await {
-            return Self::decode_region(region, enable_codec);
-        }
-
-        let region = self
-            .region_cache
-            .read_through_prev_region_by_key(key)
-            .await?;
+        let region = self.region_cache.get_prev_region_by_key(&key).await?;
         Self::decode_region(region, enable_codec)
     }
 

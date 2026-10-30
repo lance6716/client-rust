@@ -94,20 +94,24 @@ impl<C: RetryClientTrait> RegionCache<C> {
         self.read_through_region_by_key(key.clone()).await
     }
 
-    /// Return a cached predecessor whose end key is exactly `key`.
-    ///
-    /// A matching boundary is safe to use for the common case and avoids a PD
-    /// round trip. Callers still fall back to a forced read when the predecessor
-    /// is absent; region errors invalidate stale entries and trigger a refresh.
-    pub async fn get_prev_region_by_key(&self, key: &Key) -> Option<RegionWithLeader> {
-        let region_cache_guard = self.region_cache.read().await;
-        region_cache_guard
-            .key_to_ver_id
-            .range::<Key, _>(..key)
-            .next_back()
-            .and_then(|(_, ver_id)| region_cache_guard.ver_id_to_region.get(ver_id))
-            .filter(|region| region.end_key() == key.clone())
-            .cloned()
+    // Retrieve the cached predecessor by key. If there is no exact boundary,
+    // query PD and update the cache.
+    pub async fn get_prev_region_by_key(&self, key: &Key) -> Result<RegionWithLeader> {
+        let cached_region = {
+            let region_cache_guard = self.region_cache.read().await;
+            region_cache_guard
+                .key_to_ver_id
+                .range::<Key, _>(..key)
+                .next_back()
+                .and_then(|(_, ver_id)| region_cache_guard.ver_id_to_region.get(ver_id))
+                .filter(|region| region.end_key() == key.clone() && region.leader.is_some())
+                .cloned()
+        };
+
+        match cached_region {
+            Some(region) => Ok(region),
+            None => self.read_through_prev_region_by_key(key.clone()).await,
+        }
     }
 
     // Retrieve cache entry by RegionId. If there's no entry, query PD and update cache.
@@ -156,10 +160,7 @@ impl<C: RetryClientTrait> RegionCache<C> {
 
     /// Force read through (query from PD) for the region immediately before
     /// the region containing `key`.
-    pub async fn read_through_prev_region_by_key(&self, key: Key) -> Result<RegionWithLeader>
-    where
-        C: Send + Sync,
-    {
+    async fn read_through_prev_region_by_key(&self, key: Key) -> Result<RegionWithLeader> {
         let mut region = self
             .inner_client
             .clone()
@@ -592,26 +593,33 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_get_prev_region_by_key_uses_exact_cached_boundary() {
+    async fn test_get_prev_region_by_key_reads_cache_then_pd() -> Result<()> {
         let retry_client = Arc::new(MockRetryClient::default());
-        let cache = RegionCache::new(retry_client);
-        let region1 = region(1, vec![], vec![10]);
-        let region2 = region(2, vec![10], vec![20]);
+        let cache = RegionCache::new(retry_client.clone());
+        let mut region1 = region(1, vec![], vec![10]);
+        region1.leader = Some(metapb::Peer {
+            store_id: 1,
+            ..Default::default()
+        });
+        let mut region2 = region(2, vec![10], vec![20]);
+        region2.leader = Some(metapb::Peer {
+            store_id: 2,
+            ..Default::default()
+        });
         cache.add_region(region1).await;
         cache.add_region(region2.clone()).await;
 
         assert_eq!(
-            cache
-                .get_prev_region_by_key(&vec![20].into())
-                .await
-                .map(|region| region.id()),
-            Some(region2.id())
+            cache.get_prev_region_by_key(&vec![20].into()).await?.id(),
+            region2.id()
         );
+        assert_eq!(retry_client.get_region_count.load(SeqCst), 0);
         assert!(cache
             .get_prev_region_by_key(&vec![15].into())
             .await
-            .is_none());
-        assert!(cache.get_prev_region_by_key(&Key::EMPTY).await.is_none());
+            .is_err());
+        assert!(cache.get_prev_region_by_key(&Key::EMPTY).await.is_err());
+        Ok(())
     }
 
     #[tokio::test]
