@@ -41,6 +41,8 @@ pub trait RetryClientTrait {
     where
         Self: Send + Sync,
     {
+        // Keep this default for compatibility with custom retry clients that
+        // predate predecessor-region lookup.
         Err(Error::Unimplemented)
     }
 

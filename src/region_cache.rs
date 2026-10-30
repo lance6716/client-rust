@@ -94,6 +94,22 @@ impl<C: RetryClientTrait> RegionCache<C> {
         self.read_through_region_by_key(key.clone()).await
     }
 
+    /// Return a cached predecessor whose end key is exactly `key`.
+    ///
+    /// A matching boundary is safe to use for the common case and avoids a PD
+    /// round trip. Callers still fall back to a forced read when the predecessor
+    /// is absent; region errors invalidate stale entries and trigger a refresh.
+    pub async fn get_prev_region_by_key(&self, key: &Key) -> Option<RegionWithLeader> {
+        let region_cache_guard = self.region_cache.read().await;
+        region_cache_guard
+            .key_to_ver_id
+            .range::<Key, _>(..key)
+            .next_back()
+            .and_then(|(_, ver_id)| region_cache_guard.ver_id_to_region.get(ver_id))
+            .filter(|region| region.end_key() == key.clone())
+            .cloned()
+    }
+
     // Retrieve cache entry by RegionId. If there's no entry, query PD and update cache.
     pub async fn get_region_by_id(&self, id: RegionId) -> Result<RegionWithLeader> {
         for _ in 0..=MAX_RETRY_WAITING_CONCURRENT_REQUEST {
@@ -573,6 +589,29 @@ mod test {
         assert!(cache.get_region_by_key(&vec![25].into()).await.is_err());
         assert_eq!(cache.get_region_by_key(&vec![60].into()).await?, region4);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_prev_region_by_key_uses_exact_cached_boundary() {
+        let retry_client = Arc::new(MockRetryClient::default());
+        let cache = RegionCache::new(retry_client);
+        let region1 = region(1, vec![], vec![10]);
+        let region2 = region(2, vec![10], vec![20]);
+        cache.add_region(region1).await;
+        cache.add_region(region2.clone()).await;
+
+        assert_eq!(
+            cache
+                .get_prev_region_by_key(&vec![20].into())
+                .await
+                .map(|region| region.id()),
+            Some(region2.id())
+        );
+        assert!(cache
+            .get_prev_region_by_key(&vec![15].into())
+            .await
+            .is_none());
+        assert!(cache.get_prev_region_by_key(&Key::EMPTY).await.is_none());
     }
 
     #[tokio::test]

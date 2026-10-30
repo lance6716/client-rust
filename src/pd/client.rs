@@ -64,6 +64,8 @@ pub trait PdClient: Send + Sync + 'static {
     /// Return the region immediately before the region containing `key`.
     ///
     /// This is used by reverse scans when they reach a region boundary.
+    /// The default keeps existing `PdClient` implementations source-compatible;
+    /// clients that do not support predecessor lookup report `Unimplemented`.
     async fn prev_region_for_key(&self, _key: &Key) -> Result<RegionWithLeader> {
         Err(Error::Unimplemented)
     }
@@ -257,6 +259,10 @@ impl<KvC: KvConnect + Send + Sync + 'static> PdClient for PdRpcClient<KvC> {
         } else {
             key.clone()
         };
+
+        if let Some(region) = self.region_cache.get_prev_region_by_key(&key).await {
+            return Self::decode_region(region, enable_codec);
+        }
 
         let region = self
             .region_cache
