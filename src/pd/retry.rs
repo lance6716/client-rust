@@ -37,14 +37,7 @@ pub trait RetryClientTrait {
     // It does not know about encoding. Caller should take care of it.
     async fn get_region(self: Arc<Self>, key: Vec<u8>) -> Result<RegionWithLeader>;
 
-    async fn get_prev_region(self: Arc<Self>, _key: Vec<u8>) -> Result<RegionWithLeader>
-    where
-        Self: Send + Sync,
-    {
-        // Keep this default for compatibility with custom retry clients that
-        // predate predecessor-region lookup.
-        Err(Error::Unimplemented)
-    }
+    async fn get_prev_region(self: Arc<Self>, key: Vec<u8>) -> Result<RegionWithLeader>;
 
     async fn get_region_by_id(self: Arc<Self>, region_id: RegionId) -> Result<RegionWithLeader>;
 

@@ -28,7 +28,6 @@ use crate::store::TikvConnect;
 use crate::store::{KvClient, Store};
 use crate::BoundRange;
 use crate::Config;
-use crate::Error;
 use crate::Key;
 use crate::Result;
 use crate::SecurityManager;
@@ -64,11 +63,7 @@ pub trait PdClient: Send + Sync + 'static {
     /// Return the region immediately before the region containing `key`.
     ///
     /// This is used by reverse scans when they reach a region boundary.
-    /// The default keeps existing `PdClient` implementations source-compatible;
-    /// clients that do not support predecessor lookup report `Unimplemented`.
-    async fn prev_region_for_key(&self, _key: &Key) -> Result<RegionWithLeader> {
-        Err(Error::Unimplemented)
-    }
+    async fn prev_region_for_key(&self, key: &Key) -> Result<RegionWithLeader>;
 
     /// In transactional API, the returned region is decoded (keys in raw format)
     async fn region_for_id(&self, id: RegionId) -> Result<RegionWithLeader>;
