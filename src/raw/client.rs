@@ -33,6 +33,7 @@ use crate::Result;
 use crate::Value;
 
 const MAX_RAW_KV_SCAN_LIMIT: u32 = 10240;
+const MAX_REVERSE_SCAN_BOUNDARY_RETRIES: usize = 10;
 
 /// The TiKV raw `Client` is used to interact with TiKV using raw requests.
 ///
@@ -844,6 +845,7 @@ impl<PdC: PdClient> Client<PdC> {
 
     async fn last_region_for_key(&self, key: &Key) -> Result<crate::region::RegionWithLeader> {
         let mut region = self.rpc.clone().region_for_key(key).await?;
+        let mut boundary_retries = 0;
         loop {
             let end_key = region.end_key();
             if end_key.is_empty() {
@@ -852,11 +854,20 @@ impl<PdC: PdClient> Client<PdC> {
 
             let next_region = self.rpc.clone().region_for_key(&end_key).await?;
             if next_region.start_key() != end_key {
+                if boundary_retries >= MAX_REVERSE_SCAN_BOUNDARY_RETRIES {
+                    return Err(Error::InternalError {
+                        message:
+                            "failed to resolve the final region after exhausting boundary retries"
+                                .to_owned(),
+                    });
+                }
+                boundary_retries += 1;
                 self.rpc.invalidate_region_cache(region.ver_id()).await;
                 self.rpc.invalidate_region_cache(next_region.ver_id()).await;
                 region = self.rpc.clone().region_for_key(key).await?;
                 continue;
             }
+            boundary_retries = 0;
             region = next_region;
         }
     }
@@ -867,6 +878,7 @@ impl<PdC: PdClient> Client<PdC> {
     ) -> Result<(Option<RawScanResponse>, Key)> {
         let current_key = scan_args.current_key;
         let mut region_override = scan_args.initial_region.take();
+        let mut boundary_retries = 0;
         loop {
             let region = if let Some(region) = region_override.take() {
                 region
@@ -874,11 +886,21 @@ impl<PdC: PdClient> Client<PdC> {
                 let region = self.rpc.clone().region_for_key(&current_key).await?;
                 if !current_key.is_empty() && region.start_key() == current_key {
                     let previous = match self.rpc.clone().prev_region_for_key(&current_key).await {
-                        Ok(previous) if previous.end_key() == current_key => previous,
+                        Ok(previous) if previous.end_key() == current_key => {
+                            boundary_retries = 0;
+                            previous
+                        }
                         Ok(_) | Err(Error::RegionForKeyNotFound { .. }) => {
                             // The cached containing region is stale (for example,
                             // after a merge), so the predecessor no longer ends
                             // at this cursor. Drop it and resolve the cursor again.
+                            if boundary_retries >= MAX_REVERSE_SCAN_BOUNDARY_RETRIES {
+                                return Err(Error::InternalError {
+                                    message: "failed to resolve the predecessor region after exhausting boundary retries"
+                                        .to_owned(),
+                                });
+                            }
+                            boundary_retries += 1;
                             self.rpc.invalidate_region_cache(region.ver_id()).await;
                             continue;
                         }
@@ -886,9 +908,11 @@ impl<PdC: PdClient> Client<PdC> {
                     };
                     previous
                 } else {
+                    boundary_retries = 0;
                     region
                 }
             } else {
+                boundary_retries = 0;
                 self.rpc.clone().region_for_key(&current_key).await?
             };
             let store = self.rpc.clone().store_for_id(region.id()).await?;
@@ -1170,6 +1194,60 @@ mod tests {
 
         assert!(client.scan_reverse(vec![1].., 0).await?.is_empty());
         assert_eq!(lookups.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reverse_scan_stops_after_repeated_stale_boundaries() -> Result<()> {
+        let pd_client = Arc::new(
+            MockPdClient::new(MockKvClient::with_dispatch_hook(|_: &dyn Any| {
+                panic!("stale boundary must not dispatch")
+            }))
+            .with_region_for_key_hook(|_| Ok(MockPdClient::region2()))
+            .with_prev_region_for_key_hook(|_| Ok(MockPdClient::region2())),
+        );
+        let client = Client {
+            rpc: pd_client,
+            cf: None,
+            backoff: Backoff::no_backoff(),
+            atomic: false,
+            keyspace: Keyspace::Disable,
+        };
+
+        assert!(matches!(
+            client.scan_reverse(vec![1]..vec![10], 1).await,
+            Err(Error::InternalError { .. })
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reverse_scan_stops_after_repeated_final_region_boundaries() -> Result<()> {
+        let pd_client = Arc::new(
+            MockPdClient::new(MockKvClient::with_dispatch_hook(|_: &dyn Any| {
+                panic!("stale boundary must not dispatch")
+            }))
+            .with_region_for_key_hook(|key| {
+                let key_bytes: &[u8] = key.into();
+                if key_bytes == [1] {
+                    Ok(MockPdClient::region1())
+                } else {
+                    Ok(MockPdClient::region3())
+                }
+            }),
+        );
+        let client = Client {
+            rpc: pd_client,
+            cf: None,
+            backoff: Backoff::no_backoff(),
+            atomic: false,
+            keyspace: Keyspace::Disable,
+        };
+
+        assert!(matches!(
+            client.scan_reverse(vec![1].., 1).await,
+            Err(Error::InternalError { .. })
+        ));
         Ok(())
     }
 
