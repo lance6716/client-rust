@@ -519,6 +519,8 @@ impl<PdC: PdClient> Client<PdC> {
     /// If you want to include the endKey or exclude the startKey, push a '\0' to the key.
     /// An unbounded upper bound is supported by locating the final Region before
     /// traversing Regions backwards toward the lower bound.
+    /// Without a keyspace prefix, locating that Region walks Region boundaries
+    /// from the lower bound and may require a PD lookup for each uncached Region.
     /// # Examples
     /// ```rust,no_run
     /// # use tikv_client::{KvPair, Config, RawClient, IntoOwnedRange};
@@ -765,6 +767,9 @@ impl<PdC: PdClient> Client<PdC> {
                 max_limit: MAX_RAW_KV_SCAN_LIMIT,
             });
         }
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let backoff = DEFAULT_STORE_BACKOFF;
         let range = range.into().encode_keyspace(self.keyspace, KeyMode::Raw);
         let mut result = Vec::new();
@@ -918,7 +923,16 @@ impl<PdC: PdClient> Client<PdC> {
                                 .await?;
                         if status {
                             if scan_args.reverse {
-                                region_override = Some(region.clone());
+                                // Only a known-leader correction preserves the
+                                // Region metadata. EpochNotMatch may have removed
+                                // this Region ID, so resolve it by key again.
+                                if err.not_leader.as_ref().is_some_and(|e| e.leader.is_some()) {
+                                    region_override = Some(region.clone());
+                                } else if scan_args.reverse_unbounded {
+                                    region_override = Some(
+                                        self.last_region_for_key(&scan_args.range_start).await?,
+                                    );
+                                }
                             }
                             continue;
                         } else if let Some(duration) = scan_args.backoff.next_delay_duration() {
@@ -1026,6 +1040,7 @@ mod tests {
     use super::*;
     use crate::mock::MockKvClient;
     use crate::mock::MockPdClient;
+    use crate::proto::errorpb;
     use crate::proto::kvrpcpb;
     use crate::Result;
 
@@ -1129,6 +1144,32 @@ mod tests {
             looked_up_keys.lock().unwrap().as_slice(),
             &[Key::from(vec![251])]
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reverse_scan_with_zero_limit_does_not_resolve_a_region() -> Result<()> {
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let lookup_count = lookups.clone();
+        let pd_client = Arc::new(
+            MockPdClient::new(MockKvClient::with_dispatch_hook(|_: &dyn Any| {
+                panic!("zero-limit scan must not dispatch")
+            }))
+            .with_region_for_key_hook(move |_| {
+                lookup_count.fetch_add(1, Ordering::SeqCst);
+                panic!("zero-limit scan must not resolve a region")
+            }),
+        );
+        let client = Client {
+            rpc: pd_client,
+            cf: None,
+            backoff: DEFAULT_REGION_BACKOFF,
+            atomic: false,
+            keyspace: Keyspace::Disable,
+        };
+
+        assert!(client.scan_reverse(vec![1].., 0).await?.is_empty());
+        assert_eq!(lookups.load(Ordering::SeqCst), 0);
         Ok(())
     }
 
@@ -1237,6 +1278,90 @@ mod tests {
             requests.lock().unwrap().as_slice(),
             &[(vec![250, 250], vec![10]), (vec![10], vec![1])]
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reverse_scan_reloads_region_after_epoch_not_match() -> Result<()> {
+        let refreshed = Arc::new(AtomicBool::new(false));
+        let dispatch_count = Arc::new(AtomicUsize::new(0));
+        let region_refreshed = refreshed.clone();
+        let request_count = dispatch_count.clone();
+        let region_id_lookups = Arc::new(AtomicUsize::new(0));
+        let region_id_lookup_count = region_id_lookups.clone();
+        let mut stale_region = MockPdClient::region3();
+        stale_region.region.region_epoch.as_mut().unwrap().version = 0;
+        let mut refreshed_region = stale_region.clone();
+        refreshed_region.region.id = 4;
+        refreshed_region.region.start_key = vec![10];
+        refreshed_region.region.end_key = vec![];
+        refreshed_region
+            .region
+            .region_epoch
+            .as_mut()
+            .unwrap()
+            .version = 1;
+        let refreshed_for_lookup = refreshed_region.clone();
+        let refreshed_for_id = refreshed_region.clone();
+        let stale_for_id = stale_region.clone();
+        let pd_client = Arc::new(
+            MockPdClient::new(MockKvClient::with_dispatch_hook(move |req: &dyn Any| {
+                let req = req.downcast_ref::<kvrpcpb::RawScanRequest>().unwrap();
+                assert!(req.reverse);
+                if request_count.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok(Box::new(kvrpcpb::RawScanResponse {
+                        region_error: Some(errorpb::Error {
+                            epoch_not_match: Some(errorpb::EpochNotMatch {
+                                current_regions: vec![],
+                            }),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }) as Box<dyn Any>)
+                } else {
+                    assert_eq!(req.end_key, vec![10]);
+                    Ok(Box::new(kvrpcpb::RawScanResponse {
+                        kvs: vec![kvrpcpb::KvPair {
+                            key: vec![11],
+                            value: vec![42],
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }) as Box<dyn Any>)
+                }
+            }))
+            .with_region_for_key_hook(move |_| {
+                if region_refreshed.load(Ordering::SeqCst) {
+                    Ok(refreshed_for_lookup.clone())
+                } else {
+                    Ok(stale_region.clone())
+                }
+            })
+            .with_region_for_id_hook(move |id| {
+                if id == refreshed_for_id.id() {
+                    Ok(refreshed_for_id.clone())
+                } else if id == stale_for_id.id()
+                    && region_id_lookup_count.fetch_add(1, Ordering::SeqCst) == 0
+                {
+                    Ok(stale_for_id.clone())
+                } else {
+                    Err(Error::RegionNotFoundInResponse { region_id: id })
+                }
+            })
+            .with_invalidate_region_hook(move |_| {
+                refreshed.store(true, Ordering::SeqCst);
+            }),
+        );
+        let client = Client {
+            rpc: pd_client,
+            cf: None,
+            backoff: DEFAULT_REGION_BACKOFF,
+            atomic: false,
+            keyspace: Keyspace::Disable,
+        };
+
+        assert_eq!(client.scan_reverse(vec![1]..vec![255], 1).await?.len(), 1);
+        assert_eq!(dispatch_count.load(Ordering::SeqCst), 2);
         Ok(())
     }
 
